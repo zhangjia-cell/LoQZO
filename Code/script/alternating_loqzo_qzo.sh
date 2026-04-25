@@ -251,8 +251,19 @@ SAVE_STEPS=${SAVE_STEPS:-50000}
 LOGGING_STEPS=${LOGGING_STEPS:-20}
 EVAL_STEPS=${EVAL_STEPS:-1000}
 MAX_LENGTH=${MAX_LENGTH:-512}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-32}
 NO_EVAL=${NO_EVAL:-False}
 EVAL_DURING_TRAINING=${EVAL_DURING_TRAINING:-False}
+# 训练后评估是否使用 few-shot demonstrations。
+# 原脚本固定使用 32 个 demo；在 ReCoRD/SQuAD/DROP/MultiRC 这类长文本任务上，
+# 每个 eval 样本都会反复拼接和 tokenize 这些长 demo，CPU 和 GPU 都会变慢。
+# 微调后的正式评估一般设为 0-shot，因此默认关闭；如需旧行为可设 True 和 32。
+USE_EVAL_DEMOS_AFTER_TRAINING=${USE_EVAL_DEMOS_AFTER_TRAINING:-False}
+EVAL_NUM_DEMOS=${EVAL_NUM_DEMOS:-0}
+EVAL_DEMO_SEED=${EVAL_DEMO_SEED:-0}
+# 多候选评估合批大小。ReCoRD 一个样本可能有几十个 entity 候选，
+# 逐候选 forward 会非常慢；16/32 通常更合适。
+EVAL_CANDIDATE_BATCH_SIZE=${EVAL_CANDIDATE_BATCH_SIZE:-16}
 OVERWRITE_OUTPUT_DIR=${OVERWRITE_OUTPUT_DIR:-False}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 
@@ -402,9 +413,19 @@ LOQZO_RANK_EMA=${LOQZO_RANK_EMA:-0.9}
 LOQZO_BASIS_INIT=${LOQZO_BASIS_INIT:-random_orth}  # random_orth / svd_weight
 LOQZO_TARGET_MODULES=${LOQZO_TARGET_MODULES:-}
 LOQZO_INCLUDE_EMBEDDINGS=${LOQZO_INCLUDE_EMBEDDINGS:-False}
-LOQZO_FULLSPACE_FOR_1D=${LOQZO_FULLSPACE_FOR_1D:-True}
+# 默认不再对 1D norm/bias 做全空间扰动；主算法聚焦线性层权重。
+LOQZO_FULLSPACE_FOR_1D=${LOQZO_FULLSPACE_FOR_1D:-False}
 LOQZO_QUANTIZE_COEFF=${LOQZO_QUANTIZE_COEFF:-True}
 LOQZO_COEFF_BITS=${LOQZO_COEFF_BITS:-0}
+# 加速开关：低秩方向用 addmm_ 原地更新，不显式构造完整 delta。
+LOQZO_FAST_LOWRANK_UPDATE=${LOQZO_FAST_LOWRANK_UPDATE:-True}
+# 更新后每隔多少步把 latent weight 再量化一次。0 表示关闭。
+# qft forward 已经会按 WBIT/ABIT 做量化前向；每步再量化所有大矩阵会非常慢。
+LOQZO_REQUANTIZE_WEIGHT_EVERY=${LOQZO_REQUANTIZE_WEIGHT_EVERY:-0}
+# qft 只训练被 LinearQuantizer 包装的线性层 weight/bias，冻结 embedding/lm_head/norm。
+QFT_TRAIN_QUANTIZED_MODULE_ONLY=${QFT_TRAIN_QUANTIZED_MODULE_ONLY:-True}
+# 是否保留旧代码在每个 zo_lowbit update 后额外 forward 一次的行为。默认关闭。
+POST_UPDATE_FORWARD=${POST_UPDATE_FORWARD:-False}
 
 # -------------------- 交替策略和 QZO-scale 参数 --------------------
 ALT_A_STEPS=${ALT_A_STEPS:-1}                  # 每个周期 LoQZO 步数
@@ -457,7 +478,7 @@ EXTRA_ARGS=()
 [ "$GRADIENT_CHECKPOINTING" = "True" ] && EXTRA_ARGS+=(--gradient_checkpointing True)
 [ "$FORCE_DISABLE_BNB" = "True" ] && EXTRA_ARGS+=(--force_disable_bnb True)
 [ "$NO_OUTLIER" = "True" ] && EXTRA_ARGS+=(--no_outlier True)
-EXTRA_ARGS+=(--prefer_local_model "$PREFER_LOCAL_MODEL" --max_length "$MAX_LENGTH" --report_to "$REPORT_TO")
+EXTRA_ARGS+=(--prefer_local_model "$PREFER_LOCAL_MODEL" --max_length "$MAX_LENGTH" --max_new_tokens "$MAX_NEW_TOKENS" --report_to "$REPORT_TO")
 
 RUN_NAME="$TASK-${MODEL_NAME}-${PRECISION_PROFILE:-manual_W${WBIT}A${ABIT}}-altA${ALT_A_STEPS}B${ALT_B_STEPS}-r${LOQZO_RANK}-lr${LR}"
 [ -n "$TAG" ] && RUN_NAME="$TAG-$RUN_NAME"
@@ -502,6 +523,8 @@ echo "LoQZO: rank=$LOQZO_RANK adaptive=$LOQZO_ADAPTIVE_RANK basis=$LOQZO_BASIS_I
 echo "QZO-scale: scope=$QZO_SCALE_SCOPE lr_mult=$QZO_SCALE_LR_MULT layerwise=$QZO_LAYERWISE_SCALE_PERTURB clip=$CLIP_ZO_GRAD threshold=$QZO_CLIP_THRESHOLD"
 echo "QZO-scale clamp: min=$QZO_SCALE_MIN max=$QZO_SCALE_MAX max_mult=$QZO_SCALE_MAX_MULT"
 echo "TRAIN/DEV/EVAL=$TRAIN/$DEV/$EVAL | NO_EVAL=$NO_EVAL | EVAL_DURING_TRAINING=$EVAL_DURING_TRAINING"
+echo "MAX_LENGTH=$MAX_LENGTH | MAX_NEW_TOKENS=$MAX_NEW_TOKENS | EVAL_DEMOS=$USE_EVAL_DEMOS_AFTER_TRAINING/$EVAL_NUM_DEMOS | EVAL_CAND_BS=$EVAL_CANDIDATE_BATCH_SIZE"
+echo "Speed flags: qft_quantized_only=$QFT_TRAIN_QUANTIZED_MODULE_ONLY | fast_lowrank=$LOQZO_FAST_LOWRANK_UPDATE | requant_every=$LOQZO_REQUANTIZE_WEIGHT_EVERY | post_update_forward=$POST_UPDATE_FORWARD"
 echo "============================================================"
 
 COMMON_ARGS=(
@@ -513,13 +536,16 @@ COMMON_ARGS=(
   --save_strategy steps --save_steps "$SAVE_STEPS" --no_eval "$NO_EVAL"
   --quantized_perturb_ours "$TWO" --train_as_classification "$TRAIN_AS_CLS"
   --perturb_bits "$PBIT" --mask_ratio "$MASK_RATIO" --num_pertub "$NUM_PERTUB"
-  --overwrite_output_dir "$OVERWRITE_OUTPUT_DIR" --use_eval_demos_after_training True --eval_num_demos 32 --eval_demo_seed 0
+  --overwrite_output_dir "$OVERWRITE_OUTPUT_DIR" --use_eval_demos_after_training "$USE_EVAL_DEMOS_AFTER_TRAINING" --eval_num_demos "$EVAL_NUM_DEMOS" --eval_demo_seed "$EVAL_DEMO_SEED"
   --precision_profile "$PRECISION_PROFILE" --mode "$QMODE" --wmode "$WMODE" --amode "$AMODE" --wbit "$WBIT" --abit "$ABIT" --qft_freeze_alpha True --qft_alpha_only False
   --loqzo_enable "$LOQZO_ENABLE" --loqzo_rank "$LOQZO_RANK" --loqzo_adaptive_rank "$LOQZO_ADAPTIVE_RANK"
   --loqzo_rank_min "$LOQZO_RANK_MIN" --loqzo_rank_max "$LOQZO_RANK_MAX" --loqzo_rank_budget "$LOQZO_RANK_BUDGET"
   --loqzo_rank_update_freq "$LOQZO_RANK_UPDATE_FREQ" --loqzo_rank_ema "$LOQZO_RANK_EMA" --loqzo_basis_init "$LOQZO_BASIS_INIT"
   --loqzo_include_embeddings "$LOQZO_INCLUDE_EMBEDDINGS" --loqzo_fullspace_for_1d "$LOQZO_FULLSPACE_FOR_1D"
   --loqzo_quantize_coeff "$LOQZO_QUANTIZE_COEFF" --loqzo_coeff_bits "$LOQZO_COEFF_BITS"
+  --loqzo_fast_lowrank_update "$LOQZO_FAST_LOWRANK_UPDATE" --loqzo_requantize_weight_every "$LOQZO_REQUANTIZE_WEIGHT_EVERY"
+  --qft_train_quantized_module_only "$QFT_TRAIN_QUANTIZED_MODULE_ONLY" --post_update_forward "$POST_UPDATE_FORWARD"
+  --eval_candidate_batch_size "$EVAL_CANDIDATE_BATCH_SIZE"
   --alt_a_steps "$ALT_A_STEPS" --alt_b_steps "$ALT_B_STEPS" --alt_start "$ALT_START"
   --qzo_eps "$QZO_EPS" --qzo_scale_lr_mult "$QZO_SCALE_LR_MULT" --qzo_scale_min "$QZO_SCALE_MIN"
   --qzo_scale_max "$QZO_SCALE_MAX" --qzo_scale_max_mult "$QZO_SCALE_MAX_MULT"

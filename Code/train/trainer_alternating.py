@@ -164,11 +164,22 @@ class OurTrainer(LoQZOTrainer):
 
         注意：这些 alpha 在 LoQZO 阶段通常 requires_grad=False，
         但 QZO 是手动零阶更新，所以这里不能用 requires_grad 过滤。
+        量化模型结构训练中不会变，因此收集结果默认缓存，避免每个 B-step
+        都遍历一次 LLaMA 的全部 named_parameters。
         """
+        cache_key = self._qzo_scale_scope()
+        cached_key = getattr(self, "_qzo_scale_cache_key", None)
+        cached_scales = getattr(self, "_qzo_scale_parameters_cache", None)
+        if cached_scales is not None and cached_key == cache_key:
+            return cached_scales
+
         scales: List[Tuple[str, torch.nn.Parameter]] = []
         for name, param in model.named_parameters():
             if self._qzo_name_in_scope(name):
                 scales.append((name, param))
+
+        self._qzo_scale_cache_key = cache_key
+        self._qzo_scale_parameters_cache = scales
 
         if len(scales) == 0:
             # 中文说明：FP_W32A32 / W32A32 这类全精度前向不会创建 quant_weight.alpha。

@@ -1058,7 +1058,13 @@ class OurTrainer(Trainer):
                         self.zo_update(model)
                     elif args.trainer == "zo_lowbit":
                         self.lowbit_zo_update(model)
-                        self.zo_forward(model, inputs) # LoRA
+                        # 中文说明：原代码这里无条件额外做了一次 forward，注释为 "LoRA"。
+                        # 对 ZO/LoQZO/QZO 来说，每个 step 已经有 +eps / -eps 两次前向；
+                        # 这里的第三次前向既不参与梯度估计，也不参与参数更新，会把训练时间
+                        # 额外增加约 30% 以上。默认关闭，仅在调试旧 LoRA 行为时用
+                        # --post_update_forward True 手动打开。
+                        if bool(getattr(args, "post_update_forward", False)):
+                            self.zo_forward(model, inputs)
                     elif args.trainer == "zo_lowbit_ft":
                             self.lowbit_zo_ftupdate(model)
                     else:

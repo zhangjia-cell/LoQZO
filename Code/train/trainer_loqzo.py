@@ -308,11 +308,10 @@ class OurTrainer(BaseTrainer):
             )
         return zo_dequant(quantized_perturb, s, z)
 
-    def _loqzo_sample_lowrank_delta(self, name: str, param, seed: int, which: str = "q1"):
+    def _loqzo_sample_lowrank_coeff(self, name: str, param, seed: int, which: str = "q1"):
+        """采样 rank-r 子空间中的系数 z，而不是直接构造完整 delta 矩阵。"""
         state = self._loqzo_state[name]
         rank = int(state["rank"])
-        U = state["U"]
-        V = state["V"]
 
         torch.manual_seed(seed)
         z = torch.normal(
@@ -330,38 +329,88 @@ class OurTrainer(BaseTrainer):
                 z_q, s, zp = zo_quant(z, nbits=coeff_bits, seed=q_seed, stochastic=True, sym=True)
             else:
                 z_q, s, zp = zo_quant(z, nbits=coeff_bits, seed=q_seed, stochastic=False, sym=True)
-            z_hat = zo_dequant(z_q, s, zp)
-        else:
-            z_hat = z
+            return zo_dequant(z_q, s, zp)
+        return z
 
-        # U diag(z) V^T 采用更省显存的实现： (U * z[None, :]) @ V^T
-        delta = (U * z_hat.unsqueeze(0)) @ V.transpose(0, 1)
-        return delta
+    def _loqzo_apply_lowrank_delta_(self, name: str, param, coeff: torch.Tensor, alpha: float = 1.0, scale_tensor=None):
+        """
+        原地执行 param += alpha * U diag(coeff) V^T。
+
+        中文说明：
+        原实现会先显式构造完整 delta=(U*coeff)@V.T，再和参数相加。
+        LLaMA-2 7B 上这会为每个大矩阵反复分配一个完整 delta，显存带宽和
+        allocator 开销都很大。这里改用 addmm_ 把低秩乘法直接累加到参数中，
+        不再保留完整 delta 张量。
+        """
+        state = self._loqzo_state[name]
+        U = state["U"]
+        V = state["V"]
+        if scale_tensor is not None:
+            coeff = coeff * scale_tensor.to(device=coeff.device, dtype=coeff.dtype)
+        left = U * coeff.unsqueeze(0)
+        param.data.addmm_(left, V.transpose(0, 1), beta=1.0, alpha=float(alpha))
+
+    def _loqzo_sample_lowrank_delta(self, name: str, param, seed: int, which: str = "q1"):
+        """保留旧接口：需要完整 delta 时才显式构造。"""
+        coeff = self._loqzo_sample_lowrank_coeff(name, param, seed, which=which)
+        state = self._loqzo_state[name]
+        U = state["U"]
+        V = state["V"]
+        return (U * coeff.unsqueeze(0)) @ V.transpose(0, 1)
 
     def _loqzo_sample_delta(self, name: str, param, seed: int, which: str = "q1"):
         if self._loqzo_should_use_subspace(name, param):
             return self._loqzo_sample_lowrank_delta(name, param, seed, which=which)
 
-        if param.ndim == 1 and not bool(getattr(self.args, "loqzo_fullspace_for_1d", True)):
+        # 关键修复：二维参数如果没有进入 LoQZO 子空间，不再自动回退到全空间扰动。
+        # 原代码会把 embed_tokens / lm_head 这类被排除的巨大矩阵走 full-space Gaussian，
+        # LLaMA-2 7B 上会极慢；也会让 loqzo_target_modules 的“筛选”失效。
+        if param.ndim == 2 and not bool(getattr(self.args, "loqzo_fullspace_for_unselected_2d", False)):
+            return None
+
+        if param.ndim == 1 and not bool(getattr(self.args, "loqzo_fullspace_for_1d", False)):
             return None
 
         return self._loqzo_sample_fullspace_delta(param, seed, which=which)
 
     def _loqzo_perturb_parameters(self, scaling_factor=1.0, which: str = "q1"):
         seed = int(self.zo_random_seed)
+        fast_lowrank = bool(getattr(self.args, "loqzo_fast_lowrank_update", True))
         for name, param in self.named_parameters_to_optim:
-            delta = self._loqzo_sample_delta(name, param, seed, which=which)
-            if delta is not None:
-                param.data = param.data + scaling_factor * delta * self.args.zo_eps
+            if fast_lowrank and self._loqzo_should_use_subspace(name, param):
+                coeff = self._loqzo_sample_lowrank_coeff(name, param, seed, which=which)
+                self._loqzo_apply_lowrank_delta_(
+                    name,
+                    param,
+                    coeff,
+                    alpha=float(scaling_factor) * float(self.args.zo_eps),
+                )
+            else:
+                delta = self._loqzo_sample_delta(name, param, seed, which=which)
+                if delta is not None:
+                    param.data = param.data + scaling_factor * delta * self.args.zo_eps
             seed += 2
 
-    def _loqzo_update_score(self, name: str, delta: torch.Tensor, projected_grad):
+    def _loqzo_update_score(self, name: str, delta_or_coeff: torch.Tensor, projected_grad, is_coeff: bool = False, param_numel: int = 1):
         if name not in getattr(self, "_loqzo_state", {}):
             return
         state = self._loqzo_state[name]
         beta = float(getattr(self.args, "loqzo_rank_ema", 0.9))
-        score_inc = float(abs(float(projected_grad))) * float(delta.float().pow(2).mean().item())
+        if is_coeff:
+            # U/V 是正交基时，||U diag(z) V^T||_F^2 = ||z||_2^2。
+            mean_sq = float(delta_or_coeff.float().pow(2).sum().item()) / max(int(param_numel), 1)
+        else:
+            mean_sq = float(delta_or_coeff.float().pow(2).mean().item())
+        score_inc = float(abs(float(projected_grad))) * mean_sq
         state["score"] = beta * float(state.get("score", 1.0)) + (1.0 - beta) * score_inc
+
+    def _loqzo_should_requantize_weight(self) -> bool:
+        """是否在 LoQZO 更新后把 latent weight 重新压回整数低比特。"""
+        every = int(getattr(self.args, "loqzo_requantize_weight_every", 0) or 0)
+        if every <= 0:
+            return False
+        step = int(getattr(self.state, "global_step", 0)) + 1
+        return (step % every) == 0
 
     # ================================
     # 覆盖：LoQZO 版本的 step / update
@@ -428,33 +477,42 @@ class OurTrainer(BaseTrainer):
             projected_grad = self.projected_grad[i]
 
             seed = zo_random_seed_update
+            fast_lowrank = bool(getattr(self.args, "loqzo_fast_lowrank_update", True))
+            lr = float(self._get_learning_rate())
+            do_requant = self._loqzo_should_requantize_weight()
+
             for name, param in self.named_parameters_to_optim:
                 # model_parallel 时参数可能分布在不同 GPU，上一步得到的 projected_grad
                 # 需要移动到当前参数所在设备，避免 cuda:0 与 cuda:1 相乘报错。
                 pg = projected_grad.to(device=param.data.device, dtype=param.data.dtype) if isinstance(projected_grad, torch.Tensor) else projected_grad
-                delta = self._loqzo_sample_delta(name, param, seed, which="q2")
-                if delta is None:
-                    seed += 2
-                    continue
 
-                if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
-                    param.data = param.data - self._get_learning_rate() * (
-                        pg * delta + args.weight_decay * param.data
-                    )
+                if fast_lowrank and self._loqzo_should_use_subspace(name, param):
+                    coeff = self._loqzo_sample_lowrank_coeff(name, param, seed, which="q2")
+                    if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                        wd = float(getattr(args, "weight_decay", 0.0) or 0.0)
+                        if wd != 0.0:
+                            param.data.mul_(1.0 - lr * wd)
+                    # param <- param - lr * pg * U diag(coeff) V^T
+                    self._loqzo_apply_lowrank_delta_(name, param, coeff, alpha=-lr, scale_tensor=pg)
+                    self._loqzo_update_score(name, coeff, projected_grad, is_coeff=True, param_numel=param.numel())
                 else:
-                    param.data = param.data - self._get_learning_rate() * pg * delta
+                    delta = self._loqzo_sample_delta(name, param, seed, which="q2")
+                    if delta is None:
+                        seed += 2
+                        continue
 
-                self._loqzo_update_score(name, delta, projected_grad)
+                    if "bias" not in name and "layer_norm" not in name and "layernorm" not in name:
+                        param.data = param.data - lr * (pg * delta + args.weight_decay * param.data)
+                    else:
+                        param.data = param.data - lr * pg * delta
+                    self._loqzo_update_score(name, delta, projected_grad)
 
                 # 更新后是否把潜在权重重新压回整数低比特表示。
-                # 中文说明：
-                #   - INT_W8A8 / INTFP_W4A8：wmode=int，权重本身按整数低比特保存/更新；
-                #   - FP_W8A8：wmode=float，权重 latent 保持浮点，只在前向中通过 float codebook 量化；
-                #   - FP_W32A32：wbit>=16，不做权重量化。
-                # 这样可以区分 QuZO 表里的 FP、INT、INT/FP，而不是只看 WBIT/ABIT。
+                # 默认关闭，因为 qft forward 本身会做 WBIT/ABIT 前向量化；
+                # 每 step 对所有大矩阵再做一次 zo_quant_data 是 LLaMA-2 7B 慢的主要原因之一。
                 qbits = int(getattr(self.args, "wbit", 16))
                 wmode = str(getattr(self.args, "wmode", getattr(self.args, "mode", "int"))).lower()
-                if qbits < 16 and wmode == "int":
+                if do_requant and qbits < 16 and wmode == "int":
                     stochastic = bool(getattr(self.args, "quantized_perturb_ours", False))
                     qd, scaling, zero = zo_quant_data(param.data, nbits=qbits, stochastic=stochastic, sym=True)
                     param.data = zo_dequant(qd, scaling, zero)

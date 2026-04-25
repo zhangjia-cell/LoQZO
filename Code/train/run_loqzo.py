@@ -439,6 +439,19 @@ class OurArguments(TrainingArguments):
     head_tuning: bool = False
     optim: str = "sgd"
 
+    # 原 trainer_new.py 在每个 zo_lowbit step 更新后还会额外 forward 一次。
+    # 这对 LoQZO/QZO 训练没有必要，默认关闭；如需复现旧代码可手动设 True。
+    post_update_forward: bool = False
+
+    # 训练后做 ReCoRD / 多选任务评估时，把候选项合批前向。
+    # ReCoRD 每个样本可能有几十个 entity 候选，逐候选 forward 会非常慢。
+    eval_candidate_batch_size: int = 16
+
+    # qft 包装后是否只训练 LinearQuantizer 中的 weight/bias。
+    # True 时会冻结原始 embedding / lm_head / norm 等非量化模块，避免它们在 LoQZO 中
+    # 被错误地全空间扰动，这是大模型训练变慢的主要原因之一。
+    qft_train_quantized_module_only: bool = True
+
     # -------------------- 日志 / wandb --------------------
     wandb_project: str = "LoQZO"
     use_wandb: bool = False
@@ -456,9 +469,18 @@ class OurArguments(TrainingArguments):
     loqzo_basis_init: str = "random_orth"  # random_orth / svd_weight
     loqzo_target_modules: Optional[str] = None
     loqzo_include_embeddings: bool = False
-    loqzo_fullspace_for_1d: bool = True
+    loqzo_fullspace_for_1d: bool = False
     loqzo_quantize_coeff: bool = True
     loqzo_coeff_bits: int = 0
+
+    # LoQZO 加速开关：
+    # - fast_lowrank_update=True 时，低秩方向使用 addmm_ 原地加到参数上，
+    #   不再先显式构造完整 delta 矩阵；
+    # - requantize_weight_every=0 时，更新后不再每步把 latent weight 重新量化一次，
+    #   因为 qft forward 本身已经会按 WBIT/ABIT 做前向量化。
+    #   若要严格复现“每步权重也压回 int 低比特”的旧行为，可设为 1。
+    loqzo_fast_lowrank_update: bool = True
+    loqzo_requantize_weight_every: int = 0
 
 
 def parse_args() -> OurArguments:
@@ -933,14 +955,64 @@ class Framework:
                 eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
             )
             return self.tokenizer.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
-        with torch.inference_mode():
-            self.model.eval()
-            logits = self.model(input_ids=input_ids).logits
-        labels = input_ids[0, 1:]
-        logits = logits[0, :-1]
-        log_probs = F.log_softmax(logits, dim=-1)
-        selected_log_probs = log_probs[torch.arange(len(labels)).to(labels.device), labels]
-        return selected_log_probs.cpu().detach()[-option_len:]
+        return self.forward_candidates_batch([input_ids], [option_len])[0]
+
+    def forward_candidates_batch(self, encoded_candidates, option_lens):
+        """
+        合批计算多个候选答案的 option-token log-prob。
+
+        中文说明：
+        原来的评估逻辑对每个 candidate 单独 forward。ReCoRD 一个样本常有几十个
+        entity 候选，1000 个 eval 样本会变成数万次 forward，非常慢。这里把同一
+        样本的候选项按 eval_candidate_batch_size 合批，结果与逐候选 forward 等价，
+        但能显著减少 GPU kernel 启动和模型前向次数。
+        """
+        if len(encoded_candidates) == 0:
+            return []
+
+        batch_size = max(1, int(getattr(self.args, "eval_candidate_batch_size", 16) or 16))
+        outputs = []
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+
+        self.model.eval()
+        # 和训练阶段保持一致，候选答案始终位于序列末尾；这样下面取 -option_len 才可靠。
+        old_padding_side = getattr(self.tokenizer, "padding_side", "left")
+        self.tokenizer.padding_side = "left"
+        for start in range(0, len(encoded_candidates), batch_size):
+            chunk_ids = encoded_candidates[start:start + batch_size]
+            chunk_lens = option_lens[start:start + batch_size]
+            features = [{"input_ids": ids} for ids in chunk_ids]
+            batch = self.tokenizer.pad(
+                features,
+                padding=True,
+                pad_to_multiple_of=8,
+                return_tensors="pt",
+            )
+            batch = {k: v.to(self.model.device) for k, v in batch.items()}
+
+            with torch.inference_mode():
+                logits = self.model(**batch).logits
+
+            input_ids = batch["input_ids"]
+            shift_labels = input_ids[:, 1:].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous()
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+
+            safe_labels = shift_labels.clone()
+            safe_labels[safe_labels == pad_id] = 0
+            selected = torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+
+            for row_id, opt_len in enumerate(chunk_lens):
+                opt_len = int(opt_len) if opt_len is not None else 0
+                if opt_len <= 0:
+                    outputs.append(selected[row_id, :0].cpu().detach())
+                else:
+                    outputs.append(selected[row_id, -opt_len:].cpu().detach())
+
+        self.tokenizer.padding_side = old_padding_side
+        return outputs
 
     def one_step_pred(self, train_samples, eval_sample, verbose=False):
         verbose = verbose or self.args.verbose
@@ -983,20 +1055,20 @@ class Framework:
                 logger.info("Output: %s", output_text)
             return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
 
+        batch_selected_log_probs = self.forward_candidates_batch(encoded_candidates, option_lens)
+        if self.args.sfc or self.args.icl_sfc:
+            batch_sfc_selected_log_probs = self.forward_candidates_batch(sfc_encoded_candidates, sfc_option_lens)
+        else:
+            batch_sfc_selected_log_probs = [None] * len(batch_selected_log_probs)
+
         for candidate_id, encoded_candidate in enumerate(encoded_candidates):
-            selected_log_probs = self.forward(encoded_candidate, option_len=option_lens[candidate_id])
+            selected_log_probs = batch_selected_log_probs[candidate_id]
             if verbose:
                 logger.info("=== Candidate %d ===", candidate_id)
                 logger.info(self.tokenizer.decode(encoded_candidate))
                 logger.info("Log probabilities of the option tokens: %s", selected_log_probs)
 
-            if self.args.sfc or self.args.icl_sfc:
-                sfc_selected_log_probs = self.forward(
-                    sfc_encoded_candidates[candidate_id], option_len=sfc_option_lens[candidate_id]
-                )
-            else:
-                sfc_selected_log_probs = None
-
+            sfc_selected_log_probs = batch_sfc_selected_log_probs[candidate_id]
             outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs})
 
         if self.args.sfc or self.args.icl_sfc:
@@ -1106,19 +1178,49 @@ class Framework:
 
         if self.args.tuning_type == "qft":
             from quant_func.quant_model import enable_quantization, quantize_model
+            from quant_func.quant_modules import LinearQuantizer
             from quant_func.quant_utils import set_quantizer
 
             set_quantizer(self.args)
             self.model = quantize_model(self.model)
             enable_quantization(self.model)
 
+            # 中文说明：
+            # 旧代码在 qft_freeze_alpha=True 时把所有非 alpha 参数都设为可训练，
+            # 这会把 embed_tokens / lm_head / norm 等未被量化包装的参数也纳入 LoQZO。
+            # 这些大矩阵随后会走全空间扰动，LLaMA-2 7B 上会极大拖慢训练。
+            # 这里默认只训练 LinearQuantizer 内部的 weight/bias；QZO 的 alpha 虽然
+            # requires_grad=False，但仍会在 trainer_alternating.py 中被手动零阶更新。
+            quantized_param_ids = set()
+            quantized_linear_count = 0
+            if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
+                for module in self.model.modules():
+                    if isinstance(module, LinearQuantizer):
+                        quantized_linear_count += 1
+                        quantized_param_ids.add(id(module.weight))
+                        if getattr(module, "bias", None) is not None:
+                            quantized_param_ids.add(id(module.bias))
+
             for name, param in self.model.named_parameters():
+                is_alpha = ("alpha" in name)
+                in_quantized_module = id(param) in quantized_param_ids
                 if self.args.qft_alpha_only:
-                    param.requires_grad = ("alpha" in name)
+                    param.requires_grad = is_alpha
                 elif self.args.qft_freeze_alpha:
-                    param.requires_grad = ("alpha" not in name)
+                    if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
+                        param.requires_grad = in_quantized_module
+                    else:
+                        param.requires_grad = not is_alpha
                 else:
-                    param.requires_grad = True
+                    if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
+                        param.requires_grad = in_quantized_module or is_alpha
+                    else:
+                        param.requires_grad = True
+
+            if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
+                logger.info("qft 训练范围：仅 LinearQuantizer weight/bias；量化线性层数量=%d", quantized_linear_count)
+            else:
+                logger.info("qft 训练范围：旧逻辑，所有非 alpha 参数均可训练。")
 
         trainable_num = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_num = sum(p.numel() for p in self.model.parameters())
