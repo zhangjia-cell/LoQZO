@@ -32,8 +32,7 @@ LoQZO + QZO 交替优化训练器。
 from __future__ import annotations
 
 import logging
-import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -86,62 +85,39 @@ class OurTrainer(LoQZOTrainer):
         return float(getattr(self.args, "qzo_scale_min", 1e-8))
 
     def _qzo_scale_max(self) -> float:
-        """
-        scale 的绝对上界；<=0 表示不用固定绝对上界，而采用初始 alpha 的相对上界。
-        """
+        """scale 的固定最大值；<=0 表示不使用固定上界。"""
         return float(getattr(self.args, "qzo_scale_max", 0.0) or 0.0)
 
     def _qzo_scale_max_mult(self) -> float:
-        """
-        scale 的相对上界倍率。默认允许 alpha 最多涨到初始化值的 10 倍。
-        这样可以保留 QZO 对 scale 的优化空间，同时避免训练后期 alpha 无界爆炸。
-        """
-        return float(getattr(self.args, "qzo_scale_max_mult", 10.0) or 10.0)
+        """相对于初始 scale absmax 的最大倍率；<=0 表示关闭相对上界。"""
+        return float(getattr(self.args, "qzo_scale_max_mult", 10.0) or 0.0)
 
-    def _qzo_sanitize_projected_grad(self, projected_grad, name: str = "QZO projected_grad"):
-        """清洗 / 裁剪 QZO 方向导数。"""
-        threshold = float(getattr(self.args, "qzo_clip_threshold", 100.0))
-        do_clip = bool(getattr(self.args, "clip_zo_grad", False)) and threshold > 0
+    def _qzo_upper_bound_for_param(self, name: str, param: torch.nn.Parameter) -> Optional[float]:
+        """计算某个 alpha 参数的上界。优先使用固定 qzo_scale_max，否则使用初始值倍率。"""
+        fixed_max = self._qzo_scale_max()
+        if fixed_max > 0:
+            return fixed_max
 
-        if isinstance(projected_grad, torch.Tensor):
-            if not torch.isfinite(projected_grad).all():
-                logger.warning("%s 出现 NaN/Inf，已置零。", name)
-                projected_grad = torch.nan_to_num(projected_grad, nan=0.0, posinf=0.0, neginf=0.0)
-            if do_clip:
-                projected_grad = projected_grad.clamp(min=-threshold, max=threshold)
-            return projected_grad
+        max_mult = self._qzo_scale_max_mult()
+        if max_mult <= 0:
+            return None
 
-        try:
-            projected_grad = float(projected_grad)
-        except Exception:
-            logger.warning("%s 无法转成 float，已置零。", name)
-            projected_grad = 0.0
-        if not math.isfinite(projected_grad):
-            logger.warning("%s 出现 NaN/Inf，已置零。", name)
-            projected_grad = 0.0
-        if do_clip:
-            projected_grad = max(-threshold, min(threshold, projected_grad))
-        return projected_grad
+        if not hasattr(self, "_qzo_initial_scale_absmax"):
+            self._qzo_initial_scale_absmax = {}
+        if name not in self._qzo_initial_scale_absmax:
+            init_absmax = float(param.data.detach().abs().max().item())
+            init_absmax = max(init_absmax, self._qzo_scale_min())
+            self._qzo_initial_scale_absmax[name] = init_absmax
+        return self._qzo_initial_scale_absmax[name] * max_mult
 
-    def _qzo_sanitize_and_clamp_scale(self, name: str, param: torch.nn.Parameter) -> None:
-        """清洗 alpha 并限制到稳定范围。"""
-        scale_min = self._qzo_scale_min()
-        if not torch.isfinite(param.data).all():
-            logger.warning("QZO scale %s 出现 NaN/Inf，已做防御性替换。", name)
-            param.data = torch.nan_to_num(param.data, nan=scale_min, posinf=scale_min, neginf=scale_min)
-        param.data.clamp_(min=scale_min)
-
-        abs_max = self._qzo_scale_max()
-        if abs_max > 0:
-            param.data.clamp_(max=abs_max)
-            return
-
-        # 相对初始 alpha 的 element-wise 上界，防止某些通道 scale 被单独打爆。
-        bounds: Dict[str, torch.Tensor] = getattr(self, "_qzo_scale_upper_bounds", {})
-        upper = bounds.get(name)
-        if upper is not None:
-            upper = upper.to(device=param.data.device, dtype=param.data.dtype)
-            param.data.copy_(torch.minimum(param.data, upper))
+    def _qzo_clamp_scale_(self, name: str, param: torch.nn.Parameter) -> None:
+        """对 alpha 做下界/上界裁剪，防止 scale 非正或异常爆炸。"""
+        lower = self._qzo_scale_min()
+        upper = self._qzo_upper_bound_for_param(name, param)
+        if upper is None:
+            param.data.clamp_(min=lower)
+        else:
+            param.data.clamp_(min=lower, max=upper)
 
     def _qzo_scale_lr(self) -> float:
         """QZO scale 学习率；默认等于主学习率，可用 qzo_scale_lr_mult 放大/缩小。"""
@@ -195,23 +171,16 @@ class OurTrainer(LoQZOTrainer):
                 scales.append((name, param))
 
         if len(scales) == 0:
-            raise RuntimeError(
-                "未找到 QZO 可更新的 scale 参数（*.quant_weight.alpha / *.quant_input.alpha）。\n"
-                "请确认入口使用 --tuning_type qft，并且量化模型已经通过 quantize_model 包装。"
-            )
-
-        # 第一次收集 scale 时记录初始 alpha 上界，后续 QZO 更新按该上界做稳定裁剪。
-        if not hasattr(self, "_qzo_scale_upper_bounds"):
-            self._qzo_scale_upper_bounds = {}
-        scale_min = self._qzo_scale_min()
-        max_mult = self._qzo_scale_max_mult()
-        for name, param in scales:
-            if name not in self._qzo_scale_upper_bounds:
-                init_abs = param.data.detach().abs().clone()
-                init_abs = torch.nan_to_num(init_abs, nan=scale_min, posinf=scale_min, neginf=scale_min)
-                upper = init_abs.clamp(min=scale_min) * max_mult
-                self._qzo_scale_upper_bounds[name] = upper.detach()
-            self._qzo_sanitize_and_clamp_scale(name, param)
+            # 中文说明：FP_W32A32 / W32A32 这类全精度前向不会创建 quant_weight.alpha。
+            # 这种配置下 QZO-scale 没有可优化的 scale，因此自动退化为 LoQZO 权重更新，
+            # 避免为了跑表里的 FP W32A32 变体而直接报错。
+            if not getattr(self, "_qzo_no_scale_warned", False):
+                logger.warning(
+                    "当前模型没有 QZO 可更新的 scale 参数；若是 FP_W32A32，这是正常现象，"
+                    "B 阶段会自动退化为 LoQZO 权重更新。"
+                )
+                self._qzo_no_scale_warned = True
+            return scales
 
         if not getattr(self, "_qzo_scale_count_logged", False):
             logger.info(
@@ -278,7 +247,6 @@ class OurTrainer(LoQZOTrainer):
         这样可以避免 scale clamp 后无法精确恢复的问题。
         """
         eps = self._qzo_eps()
-        scale_min = self._qzo_scale_min()
         seed = int(random_seed)
 
         for idx, (name, param) in enumerate(self.qzo_scale_parameters):
@@ -286,7 +254,7 @@ class OurTrainer(LoQZOTrainer):
                 param.data.copy_(base_values[idx])
             delta = self._qzo_sample_scale_delta(param, seed, which=which)
             param.data.add_(float(scaling_factor) * eps * delta)
-            self._qzo_sanitize_and_clamp_scale(name, param)
+            self._qzo_clamp_scale_(name, param)
             seed += 2
 
     # ========================================================
@@ -295,6 +263,11 @@ class OurTrainer(LoQZOTrainer):
     def qzo_step(self, model, inputs):
         """QZO 阶段：只扰动量化 scale，估计方向导数。"""
         self.qzo_scale_parameters = self._qzo_collect_scale_parameters(model)
+        if len(self.qzo_scale_parameters) == 0:
+            # FP_W32A32 没有 alpha；此时把 B 阶段当作 LoQZO 权重更新处理。
+            self._last_qzo_step_fallback_to_loqzo = True
+            return super().lowbit_zo_step(model, inputs)
+        self._last_qzo_step_fallback_to_loqzo = False
 
         iterations = int(getattr(self.args, "num_pertub", 1))
         iterations = max(1, iterations)
@@ -317,7 +290,7 @@ class OurTrainer(LoQZOTrainer):
             loss2 = self.zo_forward(model, inputs)
 
             projected_grad = self._all_reduce_mean_scalar((loss1 - loss2) / (2.0 * self._qzo_eps()))
-            projected_grad = self._qzo_sanitize_projected_grad(projected_grad, name="QZO projected_grad")
+            projected_grad = self._qzo_clip_value(projected_grad)
             projected_grad_list.append(projected_grad)
 
             # 恢复 alpha，真正的更新在 qzo_update 中完成。
@@ -330,28 +303,26 @@ class OurTrainer(LoQZOTrainer):
 
     def qzo_update(self, model):
         """QZO 阶段：固定权重，只更新 scale。"""
+        if bool(getattr(self, "_last_qzo_step_fallback_to_loqzo", False)):
+            self._last_qzo_step_fallback_to_loqzo = False
+            return super().lowbit_zo_update(model)
+
         iterations = len(getattr(self, "qzo_random_seed", []))
         if iterations == 0:
             raise RuntimeError("qzo_update 在 qzo_step 之前被调用，未找到随机种子。")
 
         lr = self._qzo_scale_lr()
-        scale_min = self._qzo_scale_min()
-
         for i in range(iterations):
             qzo_seed = int(self.qzo_random_seed[i])
-            projected_grad = self._qzo_sanitize_projected_grad(self.qzo_projected_grad[i], name="QZO projected_grad(update)")
+            projected_grad = self._qzo_clip_value(self.qzo_projected_grad[i])
 
             seed = qzo_seed
             for name, param in self.qzo_scale_parameters:
                 # alpha 可能分布在不同 GPU，上一步的 projected_grad 需移动到当前 alpha 的设备。
                 pg = projected_grad.to(device=param.data.device, dtype=param.data.dtype) if isinstance(projected_grad, torch.Tensor) else projected_grad
                 delta = self._qzo_sample_scale_delta(param, seed, which="q2")
-                update = -lr * pg * delta
-                if not torch.isfinite(update).all():
-                    logger.warning("QZO scale %s 的更新量出现 NaN/Inf，本次更新已清零。", name)
-                    update = torch.nan_to_num(update, nan=0.0, posinf=0.0, neginf=0.0)
-                param.data.add_(update)
-                self._qzo_sanitize_and_clamp_scale(name, param)
+                param.data.add_(-lr * pg * delta)
+                self._qzo_clamp_scale_(name, param)
                 seed += 2
 
         self.lr_scheduler.step()

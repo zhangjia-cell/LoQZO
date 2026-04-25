@@ -52,6 +52,7 @@ from run_loqzo import (  # noqa: E402
     configure_reporting_and_wandb,
     detect_distributed_launch,
     normalize_task_name,
+    normalize_precision_args,
     prepare_runtime_paths,
     resolve_model_source,
     result_file_tag,
@@ -77,14 +78,14 @@ class OurArguments(_BaseOurArguments):
     qzo_eps: float = 0.0              # QZO scale 扰动半径；<=0 时复用 zo_eps
     qzo_scale_lr_mult: float = 1.0    # QZO scale 学习率倍率：lr_scale = learning_rate * mult
     qzo_scale_min: float = 1e-8       # scale 下界，防止 alpha 非正
-    qzo_scale_max: float = 0.0        # scale 绝对上界；<=0 时使用初始 alpha 的相对上界
-    qzo_scale_max_mult: float = 10.0  # scale 相对上界倍率：alpha <= init_alpha * mult
+    qzo_scale_max: float = 0.0        # scale 绝对上界；<=0 表示不使用固定上界
+    qzo_scale_max_mult: float = 10.0  # 相对初始 scale 最大倍率；<=0 表示关闭相对上界
     qzo_scale_scope: str = "weight"   # weight / activation / all
     qzo_layerwise_scale_perturb: bool = False  # True: 每个 alpha 张量共享一个随机标量
     qzo_require_qft: bool = True      # True: 自动强制 tuning_type=qft
 
     # -------------------- DDC / 方向导数裁剪 --------------------
-    clip_zo_grad: bool = True         # 是否裁剪零阶方向导数，默认开启以避免训练后期发散
+    clip_zo_grad: bool = False        # 是否裁剪 QZO 方向导数
     qzo_clip_threshold: float = 100.0 # 裁剪阈值，方向导数限制在 [-threshold, threshold]
 
 
@@ -108,7 +109,11 @@ def _normalize_alternating_args(args: OurArguments) -> None:
     }
     args.trainer = alias_map.get(args.trainer, args.trainer)
 
-    # 2) 交替训练必须启用 LoQZO 和专用 trainer。
+    # 2) 统一解释 Data Precision：FP_W32A32 / FP_W8A8 / INT_W8A8 / INTFP_W4A8。
+    #    这一步会写入 args.wbit/args.abit/args.wmode/args.amode。
+    normalize_precision_args(args)
+
+    # 3) 交替训练必须启用 LoQZO 和专用 trainer。
     args.loqzo_enable = True
     if args.trainer_module is None or args.trainer_module == "trainer_loqzo":
         args.trainer_module = "trainer_alternating"
@@ -173,7 +178,15 @@ def main(default_overrides: Optional[Dict[str, Any]] = None) -> None:
     logger.info("  B-steps / QZO scale 更新 = %d", args.alt_b_steps)
     logger.info("  cycle = %d | alt_start = %d", alt_cycle, args.alt_start)
     logger.info("  trainer = %s | trainer_module = %s | tuning_type = %s", args.trainer, args.trainer_module, args.tuning_type)
-    logger.info("  wbit = %s | abit = %s | mode = %s", args.wbit, args.abit, args.mode)
+    logger.info(
+        "  precision_profile = %s | wbit = %s | abit = %s | wmode = %s | amode = %s | legacy_mode = %s",
+        getattr(args, "precision_profile", ""),
+        args.wbit,
+        args.abit,
+        getattr(args, "wmode", args.mode),
+        getattr(args, "amode", args.mode),
+        args.mode,
+    )
     logger.info("  loqzo_rank = %s | adaptive_rank = %s | basis_init = %s", args.loqzo_rank, args.loqzo_adaptive_rank, args.loqzo_basis_init)
     logger.info("  qzo_eps = %s | qzo_scale_lr_mult = %s | qzo_scope = %s", args.qzo_eps or args.zo_eps, args.qzo_scale_lr_mult, args.qzo_scale_scope)
     logger.info("  qzo_scale_min = %s | qzo_scale_max = %s | qzo_scale_max_mult = %s", args.qzo_scale_min, args.qzo_scale_max, args.qzo_scale_max_mult)

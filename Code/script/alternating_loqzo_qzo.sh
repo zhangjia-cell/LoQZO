@@ -133,7 +133,7 @@ unset BNB_CUDA_VERSION
 # PREFER_LOCAL_MODEL 推荐保持 False，避免 MODEL=facebook/opt-1.3b 被模糊匹配到 opt-13b。
 # ============================================================
 MODEL=${MODEL:-facebook/opt-1.3b}
-MODEL_PATH=${MODEL_PATH:-}
+MODEL_PATH=${MODEL_PATH:-/home/zhangjia/Code/LoQZO/LoQZO/Models/base_models/meta-llama--Llama-2-7b-hf}
 PREFER_LOCAL_MODEL=${PREFER_LOCAL_MODEL:-False}
 
 # ============================================================
@@ -247,7 +247,7 @@ EPS=${EPS:-1e-3}
 SEED=${SEED:-0}
 STEPS=${STEPS:-5000}
 EPOCHS=${EPOCHS:-${TRAIN_EPOCHS:-0}}
-SAVE_STEPS=${SAVE_STEPS:-500}
+SAVE_STEPS=${SAVE_STEPS:-50000}
 LOGGING_STEPS=${LOGGING_STEPS:-20}
 EVAL_STEPS=${EVAL_STEPS:-1000}
 MAX_LENGTH=${MAX_LENGTH:-512}
@@ -303,11 +303,85 @@ NUM_PERTUB=${NUM_PERTUB:-1}
 MASK_RATIO=${MASK_RATIO:-0}
 TWO=${TWO:-True}
 
-# -------------------- qft 量化参数 --------------------
-WBIT=${WBIT:-4}
-ABIT=${ABIT:-8}
+# ============================================================
+# qft 量化参数：对齐 QuZO 表格的 Data Precision
+# ------------------------------------------------------------
+# 你现在主要调 PRECISION_PROFILE，而不是只调 WBIT/ABIT。
+#
+# 可选：
+#   PRECISION_PROFILE=FP_W32A32
+#       表格左侧：FP / W32A32
+#       含义：不量化权重和激活，等价全精度前向。
+#       注意：没有 quant_weight.alpha，所以 QZO-scale 阶段没有 scale 可更新；
+#             脚本默认把 ALT_B_STEPS 改成 0，算法退化为 LoQZO-only 全精度权重更新。
+#
+#   PRECISION_PROFILE=FP_W8A8
+#       表格左侧：FP / W8A8
+#       含义：权重和激活都是 8-bit floating-point codebook。
+#       映射：WBIT=8, ABIT=8, WMODE=float, AMODE=float。
+#
+#   PRECISION_PROFILE=INT_W8A8
+#       表格左侧：INT / W8A8
+#       含义：权重和激活都是 8-bit integer codebook。
+#       映射：WBIT=8, ABIT=8, WMODE=int, AMODE=int。
+#
+#   PRECISION_PROFILE=INTFP_W4A8
+#       表格左侧：INT/FP / W4A8
+#       含义：权重用 INT4，激活用 FP8。
+#       映射：WBIT=4, ABIT=8, WMODE=int, AMODE=float。
+#
+# 兼容写法：DATA_PRECISION 或 PRECISION 也可以作为别名。
+# 例如：
+#   DATA_PRECISION=INT_W8A8 bash Code/script/alternating_loqzo_qzo.sh
+#   PRECISION=FP_W8A8 bash Code/script/alternating_loqzo_qzo.sh
+#
+# 如果你不想用 profile，也可以手动指定：
+#   PRECISION_PROFILE= WBIT=4 ABIT=8 QMODE=int WMODE=int AMODE=int ...
+# 这会走手动模式。
+# ============================================================
+PRECISION_PROFILE=${PRECISION_PROFILE-${DATA_PRECISION-${PRECISION-INTFP_W4A8}}}
+PRECISION_KEY=$(echo "$PRECISION_PROFILE" | tr '[:upper:]' '[:lower:]' | sed -E 's#[/ -]+#_#g')
+
+# 记录用户是否显式设置过 ALT_B_STEPS。FP_W32A32 默认禁用 QZO-scale，
+# 但如果你显式传 ALT_B_STEPS，也不会被脚本强行覆盖；训练器里会自动 fallback。
+ALT_B_STEPS_USER_SET=0
+if [[ -n "${ALT_B_STEPS+x}" ]]; then
+  ALT_B_STEPS_USER_SET=1
+fi
+
+case "$PRECISION_KEY" in
+  fp_w32a32|fp32|w32a32)
+    PRECISION_PROFILE=FP_W32A32
+    WBIT=32; ABIT=32; QMODE=float; WMODE=float; AMODE=float
+    ;;
+  fp_w8a8|fp8|float_w8a8)
+    PRECISION_PROFILE=FP_W8A8
+    WBIT=8; ABIT=8; QMODE=float; WMODE=float; AMODE=float
+    ;;
+  int_w8a8|int8|w8a8)
+    PRECISION_PROFILE=INT_W8A8
+    WBIT=8; ABIT=8; QMODE=int; WMODE=int; AMODE=int
+    ;;
+  intfp_w4a8|int_fp_w4a8|int_fp|w4a8)
+    PRECISION_PROFILE=INTFP_W4A8
+    WBIT=4; ABIT=8; QMODE=mixed; WMODE=int; AMODE=float
+    ;;
+  ""|manual|none)
+    PRECISION_PROFILE=""
+    WBIT=${WBIT:-4}
+    ABIT=${ABIT:-8}
+    QMODE=${QMODE:-int}
+    WMODE=${WMODE:-$QMODE}
+    AMODE=${AMODE:-$QMODE}
+    ;;
+  *)
+    echo "不支持的 PRECISION_PROFILE=$PRECISION_PROFILE" >&2
+    echo "可选：FP_W32A32 / FP_W8A8 / INT_W8A8 / INTFP_W4A8；或 PRECISION_PROFILE=manual 后手动传 WBIT/ABIT/WMODE/AMODE。" >&2
+    exit 1
+    ;;
+esac
+
 PBIT=${PBIT:-4}
-QMODE=${QMODE:-int}          # int / float / flint / ant-int-float 等，取决于 quant_modules 支持
 NO_OUTLIER=${NO_OUTLIER:-False}
 LOAD_FLOAT16=${LOAD_FLOAT16:-False}
 LOAD_BFLOAT16=${LOAD_BFLOAT16:-False}
@@ -335,15 +409,20 @@ LOQZO_COEFF_BITS=${LOQZO_COEFF_BITS:-0}
 # -------------------- 交替策略和 QZO-scale 参数 --------------------
 ALT_A_STEPS=${ALT_A_STEPS:-1}                  # 每个周期 LoQZO 步数
 ALT_B_STEPS=${ALT_B_STEPS:-1}                  # 每个周期 QZO-scale 步数
+# FP_W32A32 不产生量化 scale(alpha)。为了避免表格中的全精度变体误跑 QZO，
+# 如果用户没有显式指定 ALT_B_STEPS，则默认只跑 LoQZO 权重更新。
+if [[ "$PRECISION_PROFILE" == "FP_W32A32" && "$ALT_B_STEPS_USER_SET" == "0" ]]; then
+  ALT_B_STEPS=0
+fi
 ALT_START=${ALT_START:-0}                      # 前 ALT_START 步只跑 LoQZO warmup
 QZO_EPS=${QZO_EPS:-0}                          # <=0 时复用 EPS
-QZO_SCALE_LR_MULT=${QZO_SCALE_LR_MULT:-1.0}    # scale 学习率倍率；不稳定时可设 0.1
-QZO_SCALE_MIN=${QZO_SCALE_MIN:-1e-8}            # scale 下界，避免 alpha <= 0
-QZO_SCALE_MAX=${QZO_SCALE_MAX:-0}               # scale 绝对上界；0 表示不用绝对上界
-QZO_SCALE_MAX_MULT=${QZO_SCALE_MAX_MULT:-10.0}  # scale 相对上界：alpha <= 初始 alpha * 该倍率
-QZO_SCALE_SCOPE=${QZO_SCALE_SCOPE:-weight}      # weight / activation / all
+QZO_SCALE_LR_MULT=${QZO_SCALE_LR_MULT:-1.0}    # scale 学习率倍率
+QZO_SCALE_MIN=${QZO_SCALE_MIN:-1e-8}
+QZO_SCALE_MAX=${QZO_SCALE_MAX:-0}              # 固定上界；0 表示不用固定上界
+QZO_SCALE_MAX_MULT=${QZO_SCALE_MAX_MULT:-10.0} # 相对初始 scale 的最大倍率；<=0 表示关闭
+QZO_SCALE_SCOPE=${QZO_SCALE_SCOPE:-weight}     # weight / activation / all
 QZO_LAYERWISE_SCALE_PERTURB=${QZO_LAYERWISE_SCALE_PERTURB:-False}
-CLIP_ZO_GRAD=${CLIP_ZO_GRAD:-True}              # 默认开启方向导数裁剪，避免训练后期发散
+CLIP_ZO_GRAD=${CLIP_ZO_GRAD:-False}
 QZO_CLIP_THRESHOLD=${QZO_CLIP_THRESHOLD:-100.0}
 
 # -------------------- WandB / 日志 --------------------
@@ -380,7 +459,7 @@ EXTRA_ARGS=()
 [ "$NO_OUTLIER" = "True" ] && EXTRA_ARGS+=(--no_outlier True)
 EXTRA_ARGS+=(--prefer_local_model "$PREFER_LOCAL_MODEL" --max_length "$MAX_LENGTH" --report_to "$REPORT_TO")
 
-RUN_NAME="$TASK-${MODEL_NAME}-altA${ALT_A_STEPS}B${ALT_B_STEPS}-W${WBIT}A${ABIT}-r${LOQZO_RANK}-lr${LR}"
+RUN_NAME="$TASK-${MODEL_NAME}-${PRECISION_PROFILE:-manual_W${WBIT}A${ABIT}}-altA${ALT_A_STEPS}B${ALT_B_STEPS}-r${LOQZO_RANK}-lr${LR}"
 [ -n "$TAG" ] && RUN_NAME="$TAG-$RUN_NAME"
 [ "$LOQZO_ADAPTIVE_RANK" = "True" ] && RUN_NAME="$RUN_NAME-adarank"
 [ "$QZO_SCALE_SCOPE" != "weight" ] && RUN_NAME="$RUN_NAME-qzoscope${QZO_SCALE_SCOPE}"
@@ -417,7 +496,7 @@ echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<系统默认>}"
 echo "PYTHONPATH : $PYTHONPATH"
 echo "BS(real)=$REAL_BS | BS(per_device)=$BS | GRAD_ACC=$GRAD_ACC"
 echo "LR=$LR | EPS=$EPS | QZO_EPS=${QZO_EPS} | STEPS=$STEPS | EPOCHS=$EPOCHS"
-echo "WBIT/ABIT/PBIT=$WBIT/$ABIT/$PBIT | QMODE=$QMODE"
+echo "PRECISION_PROFILE=${PRECISION_PROFILE:-manual} | WBIT/ABIT/PBIT=$WBIT/$ABIT/$PBIT | QMODE=$QMODE | WMODE=$WMODE | AMODE=$AMODE"
 echo "ALT: LoQZO=$ALT_A_STEPS | QZO-scale=$ALT_B_STEPS | ALT_START=$ALT_START"
 echo "LoQZO: rank=$LOQZO_RANK adaptive=$LOQZO_ADAPTIVE_RANK basis=$LOQZO_BASIS_INIT"
 echo "QZO-scale: scope=$QZO_SCALE_SCOPE lr_mult=$QZO_SCALE_LR_MULT layerwise=$QZO_LAYERWISE_SCALE_PERTURB clip=$CLIP_ZO_GRAD threshold=$QZO_CLIP_THRESHOLD"
@@ -435,7 +514,7 @@ COMMON_ARGS=(
   --quantized_perturb_ours "$TWO" --train_as_classification "$TRAIN_AS_CLS"
   --perturb_bits "$PBIT" --mask_ratio "$MASK_RATIO" --num_pertub "$NUM_PERTUB"
   --overwrite_output_dir "$OVERWRITE_OUTPUT_DIR" --use_eval_demos_after_training True --eval_num_demos 32 --eval_demo_seed 0
-  --mode "$QMODE" --wbit "$WBIT" --abit "$ABIT" --qft_freeze_alpha True --qft_alpha_only False
+  --precision_profile "$PRECISION_PROFILE" --mode "$QMODE" --wmode "$WMODE" --amode "$AMODE" --wbit "$WBIT" --abit "$ABIT" --qft_freeze_alpha True --qft_alpha_only False
   --loqzo_enable "$LOQZO_ENABLE" --loqzo_rank "$LOQZO_RANK" --loqzo_adaptive_rank "$LOQZO_ADAPTIVE_RANK"
   --loqzo_rank_min "$LOQZO_RANK_MIN" --loqzo_rank_max "$LOQZO_RANK_MAX" --loqzo_rank_budget "$LOQZO_RANK_BUDGET"
   --loqzo_rank_update_freq "$LOQZO_RANK_UPDATE_FREQ" --loqzo_rank_ema "$LOQZO_RANK_EMA" --loqzo_basis_init "$LOQZO_BASIS_INIT"
@@ -485,7 +564,6 @@ esac
 # ========================= 运行命令示例 =========================
 # 1) 单卡 OPT-1.3B / SST2 / W4A8 / 1:1 交替，按步数训练：
 # GPU_ID=0 TASK=SST2 MODEL=facebook/opt-1.3b STEPS=5000 WBIT=4 ABIT=8 ALT_A_STEPS=1 ALT_B_STEPS=1 LOQZO_RANK=8 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_r8
-# 若 loss 后期发散，可进一步收紧：QZO_SCALE_LR_MULT=0.1 QZO_CLIP_THRESHOLD=10
 #
 # 2) 多卡模型并行，GPU_ID 填多个即可；auto 会切到 model_parallel：
 # GPU_ID=0,1 TASK=BoolQ MODEL=facebook/opt-6.7b STEPS=5000 BS=8 WBIT=4 ABIT=8 bash Code/script/alternating_loqzo_qzo.sh --logname boolq_6.7b_2gpu
@@ -506,3 +584,16 @@ esac
 # GPU_ID=0 TASK=SQuAD MODEL=facebook/opt-1.3b STEPS=5000 WBIT=4 ABIT=8 bash Code/script/alternating_loqzo_qzo.sh --logname squad_default
 # GPU_ID=0 TASK=ReCoRD MODEL=facebook/opt-1.3b STEPS=5000 WBIT=4 ABIT=8 bash Code/script/alternating_loqzo_qzo.sh --logname record_default
 # GPU_ID=0 TASK=DROP MODEL=facebook/opt-1.3b STEPS=5000 WBIT=4 ABIT=8 bash Code/script/alternating_loqzo_qzo.sh --logname drop_default
+
+# 7) 对齐 QuZO 表 1 的 Data Precision 跑我们自己的算法：
+# FP / W32A32：全精度前向，无 scale，默认只跑 LoQZO。
+# GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=FP_W32A32 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_fp_w32a32
+#
+# FP / W8A8：权重 float8，激活 float8。
+# GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=FP_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_fp_w8a8
+#
+# INT / W8A8：权重 int8，激活 int8。
+# GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=INT_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_int_w8a8
+#
+# INT/FP / W4A8：权重 int4，激活 float8。默认 profile 就是这个。
+# GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=INTFP_W4A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_intfp_w4a8

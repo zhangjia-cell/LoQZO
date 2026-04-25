@@ -55,40 +55,6 @@ class OurTrainer(BaseTrainer):
     def log(self, logs: Dict[str, float]) -> None:
         super().log(self._compact_logs(logs))
 
-
-    def _sanitize_zo_scalar(self, value, name: str = "projected_grad"):
-        """
-        清洗零阶方向导数，防止异常 batch 导致参数爆炸。
-
-        说明：
-        零阶估计是 (loss_plus - loss_minus) / (2 * eps)，当某个扰动方向使
-        loss 极大时，该标量会非常大，随后会直接乘到所有参数更新上。
-        如果继续不裁剪，低比特随机舍入阶段容易出现 NaN/Inf，进而触发
-        CUDA 的 Bernoulli 概率断言错误。
-        """
-        threshold = float(getattr(self.args, "qzo_clip_threshold", 100.0))
-        do_clip = bool(getattr(self.args, "clip_zo_grad", False)) and threshold > 0
-
-        if isinstance(value, torch.Tensor):
-            if not torch.isfinite(value).all():
-                logger.warning("%s 出现 NaN/Inf，已置零以保证训练继续。", name)
-                value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-            if do_clip:
-                value = value.clamp(min=-threshold, max=threshold)
-            return value
-
-        try:
-            value = float(value)
-        except Exception:
-            logger.warning("%s 无法转成 float，已置零。", name)
-            value = 0.0
-        if not math.isfinite(value):
-            logger.warning("%s 出现 NaN/Inf，已置零以保证训练继续。", name)
-            value = 0.0
-        if do_clip:
-            value = max(-threshold, min(threshold, value))
-        return value
-
     # ================================
     # 分布式辅助函数（若基类没有，就在这里兜底）
     # ================================
@@ -431,14 +397,12 @@ class OurTrainer(BaseTrainer):
             loss2 = self.zo_forward(model, inputs)
 
             projected_grad = self._all_reduce_mean_scalar((loss1 - loss2) / (2 * self.args.zo_eps))
-            projected_grad = self._sanitize_zo_scalar(projected_grad, name="LoQZO projected_grad")
 
-            # 标量也做一次轻量量化，和当前 QuZO 代码习惯保持一致。
-            # 这里额外处理 NaN/Inf/0，避免 s 非法导致后续更新发散。
+            # 标量也做一次轻量量化，和当前 QuZO 代码习惯保持一致
             max_abs_value = torch.max(torch.abs(projected_grad))
             s = max_abs_value / 127
-            if (not torch.isfinite(s).all()) or float(s) == 0.0:
-                s = torch.tensor(1e-6, device=projected_grad.device, dtype=projected_grad.dtype)
+            if float(s) == 0.0:
+                s = torch.tensor(1e-3, device=projected_grad.device)
             quantized_grad = torch.round(projected_grad / s)
             quantized_grad = torch.clamp(quantized_grad, -127, 127)
             projected_grad = quantized_grad * s
@@ -461,7 +425,7 @@ class OurTrainer(BaseTrainer):
 
         for i in range(iterations):
             zo_random_seed_update = int(self.zo_random_seed[i])
-            projected_grad = self._sanitize_zo_scalar(self.projected_grad[i], name="LoQZO projected_grad(update)")
+            projected_grad = self.projected_grad[i]
 
             seed = zo_random_seed_update
             for name, param in self.named_parameters_to_optim:
@@ -480,16 +444,17 @@ class OurTrainer(BaseTrainer):
                 else:
                     param.data = param.data - self._get_learning_rate() * pg * delta
 
-                # 更新后先清理一次非有限值，防止量化随机舍入阶段收到 NaN/Inf。
-                if not torch.isfinite(param.data).all():
-                    logger.warning("参数 %s 更新后出现 NaN/Inf，已用 0 做防御性替换。", name)
-                    param.data = torch.nan_to_num(param.data, nan=0.0, posinf=0.0, neginf=0.0)
-
                 self._loqzo_update_score(name, delta, projected_grad)
 
-                # 更新后继续保留低比特参数表示，贴近 QuZO 的量化训练设定
+                # 更新后是否把潜在权重重新压回整数低比特表示。
+                # 中文说明：
+                #   - INT_W8A8 / INTFP_W4A8：wmode=int，权重本身按整数低比特保存/更新；
+                #   - FP_W8A8：wmode=float，权重 latent 保持浮点，只在前向中通过 float codebook 量化；
+                #   - FP_W32A32：wbit>=16，不做权重量化。
+                # 这样可以区分 QuZO 表里的 FP、INT、INT/FP，而不是只看 WBIT/ABIT。
                 qbits = int(getattr(self.args, "wbit", 16))
-                if qbits < 16:
+                wmode = str(getattr(self.args, "wmode", getattr(self.args, "mode", "int"))).lower()
+                if qbits < 16 and wmode == "int":
                     stochastic = bool(getattr(self.args, "quantized_perturb_ours", False))
                     qd, scaling, zero = zo_quant_data(param.data, nbits=qbits, stochastic=stochastic, sym=True)
                     param.data = zo_dequant(qd, scaling, zero)

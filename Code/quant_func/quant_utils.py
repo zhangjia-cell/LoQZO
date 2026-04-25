@@ -12,7 +12,25 @@ import torch.distributed as dist
 quant_args = {}
 def set_quantizer(args):
     global quant_args
-    quant_args.update({'mode' : args.mode, 'wbit': args.wbit, 'abit': args.abit, 'args' : args})
+
+    # 中文说明：
+    # 旧代码只有 args.mode，一个 mode 同时控制权重和激活。
+    # 为了对齐 QuZO 表格里的 FP W8A8 / INT W8A8 / INT-FP W4A8，
+    # 这里新增 wmode/amode：
+    #   wmode 控制权重量化 codebook，例如 int / float / flint；
+    #   amode 控制激活量化 codebook，例如 int / float / flint。
+    # 如果脚本没有显式传 wmode/amode，则退回到 args.mode，保持旧实验完全兼容。
+    wmode = getattr(args, 'wmode', None) or getattr(args, 'weight_quant_mode', None) or args.mode
+    amode = getattr(args, 'amode', None) or getattr(args, 'activation_quant_mode', None) or args.mode
+
+    quant_args.update({
+        'mode': args.mode,
+        'wmode': wmode,
+        'amode': amode,
+        'wbit': args.wbit,
+        'abit': args.abit,
+        'args': args,
+    })
 
 
 logger = logging.getLogger(__name__)

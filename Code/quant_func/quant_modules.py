@@ -407,11 +407,15 @@ class Conv1dQuantizer(nn.Module):
     """
     Class to quantize given convolutional layer
     """
-    def __init__(self, mode=None, wbit=None, abit=None, args=None):
+    def __init__(self, mode=None, wbit=None, abit=None, args=None, wmode=None, amode=None):
         super(Conv1dQuantizer, self).__init__()
         assert mode is not None,'Quantizer is not initilized!'
-        self.quant_weight = TensorQuantizer(mode=mode, bit=wbit, is_signed=True, is_enable=True, args=args, operator=self._conv_forward)
-        self.quant_input  = TensorQuantizer(mode=mode, bit=abit, is_signed=False, is_enable=True, args=args, operator=self._conv_forward, is_input=True)
+        # wmode / amode 用来分别控制权重和激活的数值格式；
+        # 不显式传入时沿用旧参数 mode，保证旧脚本兼容。
+        wmode = wmode or mode
+        amode = amode or mode
+        self.quant_weight = TensorQuantizer(mode=wmode, bit=wbit, is_signed=True, is_enable=True, args=args, operator=self._conv_forward)
+        self.quant_input  = TensorQuantizer(mode=amode, bit=abit, is_signed=False, is_enable=True, args=args, operator=self._conv_forward, is_input=True)
 
     def set_param(self, conv):
 
@@ -438,11 +442,15 @@ class Conv2dQuantizer(nn.Module):
     """
     Class to quantize given convolutional layer
     """
-    def __init__(self, mode=None, wbit=None, abit=None, args=None):
+    def __init__(self, mode=None, wbit=None, abit=None, args=None, wmode=None, amode=None):
         super(Conv2dQuantizer, self).__init__()
         assert mode is not None,'Quantizer is not initilized!'
-        self.quant_weight = TensorQuantizer(mode=mode, bit=wbit, is_signed=True, is_enable=True, args=args, operator=self._conv_forward)
-        self.quant_input  = TensorQuantizer(mode=mode, bit=abit, is_signed=False, is_enable=True, args=args, operator=self._conv_forward, is_input=True)
+        # wmode / amode 用来分别控制权重和激活的数值格式；
+        # 不显式传入时沿用旧参数 mode，保证旧脚本兼容。
+        wmode = wmode or mode
+        amode = amode or mode
+        self.quant_weight = TensorQuantizer(mode=wmode, bit=wbit, is_signed=True, is_enable=True, args=args, operator=self._conv_forward)
+        self.quant_input  = TensorQuantizer(mode=amode, bit=abit, is_signed=False, is_enable=True, args=args, operator=self._conv_forward, is_input=True)
 
     def set_param(self, conv):
         self.in_channels = conv.in_channels
@@ -482,16 +490,32 @@ class LinearQuantizer(nn.Module):
        再插入量化模块时出现 CPU/GPU device mismatch；
     3) QZO 交替优化会直接更新 quant_weight.alpha，因此这里保持 alpha 为 nn.Parameter。
     """
-    def __init__(self, mode=None, wbit=None, abit=None, args=None):
+    def __init__(self, mode=None, wbit=None, abit=None, args=None, wmode=None, amode=None):
         super(LinearQuantizer, self).__init__()
         assert mode is not None, 'Quantizer is not initilized!'
+
+        # 中文说明：
+        #   mode  是旧代码里的统一数值格式；
+        #   wmode 是权重量化格式；amode 是激活量化格式。
+        # 这样就能复现实验表中的 FP W8A8、INT W8A8、INT/FP W4A8：
+        #   FP W8A8     -> wmode=float, amode=float, wbit=8, abit=8
+        #   INT W8A8    -> wmode=int,   amode=int,   wbit=8, abit=8
+        #   INT/FP W4A8 -> wmode=int,   amode=float, wbit=4, abit=8
+        # 不传 wmode/amode 时自动沿用 mode，保证原有 WBIT/ABIT/QMODE 脚本不受影响。
+        wmode = wmode or mode
+        amode = amode or mode
+        self.wmode = wmode
+        self.amode = amode
+
         if wbit <= 8:
-            self.quant_weight = TensorQuantizer(mode=mode, bit=wbit, is_signed=True, is_enable=True, args=args, operator=F.linear)
+            self.quant_weight = TensorQuantizer(mode=wmode, bit=wbit, is_signed=True, is_enable=True, args=args, operator=F.linear)
         else:
+            # wbit > 8 视为不做权重量化，例如 FP W32A32。
             self.quant_weight = None
         if abit <= 8:
-            self.quant_input = TensorQuantizer(mode=mode, bit=abit, is_signed=False, is_enable=True, args=args, operator=F.linear, is_input=True)
+            self.quant_input = TensorQuantizer(mode=amode, bit=abit, is_signed=False, is_enable=True, args=args, operator=F.linear, is_input=True)
         else:
+            # abit > 8 视为不做激活量化，例如 FP W32A32。
             self.quant_input = None
 
     def set_param(self, linear):

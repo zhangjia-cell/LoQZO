@@ -396,7 +396,16 @@ class OurArguments(TrainingArguments):
     eos_token: str = "\n"
 
     # -------------------- 量化训练 / qft --------------------
+    # precision_profile 用来一键对齐 QuZO 表格里的“Data Precision”：
+    #   FP_W32A32    -> 不做 W/A 量化，等价全精度前向；此时 QZO-scale 没有 alpha，会自动退化为 LoQZO-only；
+    #   FP_W8A8      -> 权重/激活都用 float codebook 的 8-bit 量化；
+    #   INT_W8A8     -> 权重/激活都用 int codebook 的 8-bit 量化；
+    #   INTFP_W4A8   -> 权重用 int4，激活用 float8，对齐表里的 INT/FP W4A8。
+    # mode 是旧参数，未显式设置 wmode/amode 时仍然作为默认数值格式。
+    precision_profile: str = ""
     mode: str = "int"
+    wmode: Optional[str] = None
+    amode: Optional[str] = None
     wbit: int = 8
     abit: int = 8
     percent: int = 100
@@ -456,6 +465,81 @@ def parse_args() -> OurArguments:
     parser = HfArgumentParser(OurArguments)
     args = parser.parse_args_into_dataclasses()[0]
     return args
+
+
+def normalize_precision_args(args: OurArguments) -> None:
+    """
+    统一解释实验表中的 Data Precision 配置。
+
+    中文说明：
+    - 旧代码只有 WBIT/ABIT/QMODE，因此只能表达“几比特 + 一个统一 codebook”；
+    - QuZO 表格里的 FP / INT / INT-FP 实际还涉及 codebook 类型；
+    - 这里把它拆成 wmode/amode：wmode 控制权重格式，amode 控制激活格式。
+
+    支持的 profile：
+    - FP_W32A32 / W32A32 / FP32：wbit=32, abit=32, wmode=float, amode=float；
+    - FP_W8A8 / FP8 / FP_W8：wbit=8, abit=8, wmode=float, amode=float；
+    - INT_W8A8 / INT8 / W8A8：wbit=8, abit=8, wmode=int, amode=int；
+    - INTFP_W4A8 / INT_FP_W4A8 / W4A8：wbit=4, abit=8, wmode=int, amode=float。
+
+    注意：FP_W32A32 不会生成 quant_weight.alpha，因此不能真正做 QZO-scale；
+    交替训练器会在 QZO 阶段自动退回 LoQZO 权重更新。
+    """
+    raw_profile = str(getattr(args, "precision_profile", "") or "").strip()
+    profile = raw_profile.lower().replace("-", "_").replace("/", "_").replace(" ", "")
+
+    profile_map = {
+        "fp_w32a32": (32, 32, "float", "float", "FP-W32A32"),
+        "fp32": (32, 32, "float", "float", "FP-W32A32"),
+        "w32a32": (32, 32, "float", "float", "FP-W32A32"),
+        "fp_w8a8": (8, 8, "float", "float", "FP-W8A8"),
+        "fp8": (8, 8, "float", "float", "FP-W8A8"),
+        "float_w8a8": (8, 8, "float", "float", "FP-W8A8"),
+        "int_w8a8": (8, 8, "int", "int", "INT-W8A8"),
+        "int8": (8, 8, "int", "int", "INT-W8A8"),
+        "w8a8": (8, 8, "int", "int", "INT-W8A8"),
+        "intfp_w4a8": (4, 8, "int", "float", "INT/FP-W4A8"),
+        "int_fp_w4a8": (4, 8, "int", "float", "INT/FP-W4A8"),
+        "int_fp": (4, 8, "int", "float", "INT/FP-W4A8"),
+        "w4a8": (4, 8, "int", "float", "INT/FP-W4A8"),
+    }
+
+    if profile:
+        if profile not in profile_map:
+            raise ValueError(
+                f"未知 precision_profile={raw_profile}。可选："
+                "FP_W32A32, FP_W8A8, INT_W8A8, INTFP_W4A8。"
+            )
+        wbit, abit, wmode, amode, label = profile_map[profile]
+        args.wbit = int(wbit)
+        args.abit = int(abit)
+        args.wmode = wmode
+        args.amode = amode
+        args.mode = wmode if wmode == amode else "mixed"
+        args.precision_profile = label
+    else:
+        # 没有 profile 时保持旧行为：wmode/amode 为空就继承 mode。
+        args.wmode = getattr(args, "wmode", None) or getattr(args, "mode", "int")
+        args.amode = getattr(args, "amode", None) or getattr(args, "mode", "int")
+        if not getattr(args, "precision_profile", ""):
+            if int(getattr(args, "wbit", 8)) > 8 and int(getattr(args, "abit", 8)) > 8:
+                args.precision_profile = "FP-W32A32"
+            elif args.wmode == "float" and args.amode == "float":
+                args.precision_profile = f"FP-W{args.wbit}A{args.abit}"
+            elif args.wmode == "int" and args.amode == "int":
+                args.precision_profile = f"INT-W{args.wbit}A{args.abit}"
+            else:
+                args.precision_profile = f"{args.wmode.upper()}/{args.amode.upper()}-W{args.wbit}A{args.abit}"
+
+    logger.info(
+        "量化精度配置 | profile=%s | wbit=%s | abit=%s | wmode=%s | amode=%s | legacy_mode=%s",
+        args.precision_profile,
+        args.wbit,
+        args.abit,
+        args.wmode,
+        args.amode,
+        args.mode,
+    )
 
 
 def prepare_runtime_paths(args: OurArguments) -> None:
@@ -1168,6 +1252,7 @@ def main(default_overrides: Optional[Dict[str, Any]] = None) -> None:
     setup_logging(args.output_dir, log_filename=os.environ.get("LOQZO_LOG_FILENAME", "train.log"))
     configure_reporting_and_wandb(args)
     set_seed_all(args.seed)
+    normalize_precision_args(args)
 
     # trainer 别名统一
     alias_map = {
