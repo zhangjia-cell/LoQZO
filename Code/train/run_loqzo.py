@@ -426,11 +426,49 @@ class OurArguments(TrainingArguments):
     smooth: bool = False
     qft_freeze_alpha: bool = True
     qft_alpha_only: bool = False
+    # 只训练被 LinearQuantizer 包装后的线性层权重/偏置。
+    # 对 LoQZO+QZO 来说，lm_head / embedding / norm 这类未量化或非矩阵目标不需要参与零阶扰动；
+    # 关闭它们可以避免在 LLaMA-2 上出现巨大的全空间扰动开销。默认 False 保持旧 baseline 行为，
+    # alternating 脚本会显式打开。
+    qft_train_quantized_linear_only: bool = False
+    qft_train_bias: bool = False
 
     # -------------------- 其他训练控制 --------------------
     save_model: bool = False
     no_eval: bool = False
     save_on_interrupt: bool = False
+
+    # -------------------- ZO/LoQZO 加速开关 --------------------
+    # skip_post_update_forward=True 会跳过 trainer_new 中 lowbit_zo_update 后额外的一次 forward。
+    # 这次 forward 原本主要给 LoRA/调试用，对 LoQZO+QZO 的参数更新没有贡献，关闭后算法更新公式不变。
+    skip_post_update_forward: bool = True
+    # cache_trainable_params=True：训练开始后 requires_grad 基本固定，缓存待优化参数列表，避免每步遍历 7B 模型参数。
+    cache_trainable_params: bool = True
+    # loqzo_fast_addmm=True：低秩扰动用 addmm_ 原地写入，避免每层反复分配完整 delta 矩阵。
+    loqzo_fast_addmm: bool = True
+    # qzo_cache_scale_params / qzo_cache_scale_deltas：缓存 QZO scale 参数列表和当前随机方向，减少 CPU 遍历和随机数生成开销。
+    qzo_cache_scale_params: bool = True
+    qzo_cache_scale_deltas: bool = True
+    # prepare_inputs_once_for_zo=True：同一个 ZO step 的 +eps/-eps 两次 forward 复用已经搬到 GPU 的 batch，
+    # 避免同一批数据重复 CPU->GPU 拷贝。
+    prepare_inputs_once_for_zo: bool = True
+    # fast_zo_eval_mode=True：ZO forward 期间模型一直处于 eval，避免每次 forward 递归调用 model.eval()。
+    fast_zo_eval_mode: bool = True
+    # disable_train_use_cache=True：训练 loss 不需要 past_key_values，关闭 use_cache 可避免无用 KV cache 计算/返回。
+    disable_train_use_cache: bool = True
+    # fast_option_loss=True：only_train_option 训练时只对 option token 的 hidden states 计算 lm_head/log_softmax，
+    # 不再为整段 prompt 的所有位置计算完整 vocab logits。默认 False 以免影响旧 baseline；交替脚本会显式打开。
+    fast_option_loss: bool = False
+    # fast_eval_batch_options=True：最终评估时把同一个样本的多个 candidate 合成一个小 batch，
+    # 并且可复用 fast_option_loss 的“只算 option token logits”路径，显著减少 MultiRC/COPA/CB 的评估时间。
+    fast_eval_batch_options: bool = False
+    # ZO 训练中每 step 计算 floating_point_ops 和 NaN/Inf 过滤都会带来 Python/GPU 同步；
+    # 对零阶训练主结果没有贡献，交替脚本默认关闭。
+    skip_flos_meter_for_zo: bool = False
+    disable_nan_inf_filter_for_zo: bool = False
+    # int codebook 的快速均匀量化路径；只有 no_outlier=True 且 mode=int 时才完全等价启用，
+    # 因此外部 baseline 默认不受影响。
+    fast_int_quant: bool = True
     tag: str = ""
     verbose: bool = False
     untie_emb: bool = False
@@ -438,19 +476,6 @@ class OurArguments(TrainingArguments):
     lp_early_stopping: bool = False
     head_tuning: bool = False
     optim: str = "sgd"
-
-    # 原 trainer_new.py 在每个 zo_lowbit step 更新后还会额外 forward 一次。
-    # 这对 LoQZO/QZO 训练没有必要，默认关闭；如需复现旧代码可手动设 True。
-    post_update_forward: bool = False
-
-    # 训练后做 ReCoRD / 多选任务评估时，把候选项合批前向。
-    # ReCoRD 每个样本可能有几十个 entity 候选，逐候选 forward 会非常慢。
-    eval_candidate_batch_size: int = 16
-
-    # qft 包装后是否只训练 LinearQuantizer 中的 weight/bias。
-    # True 时会冻结原始 embedding / lm_head / norm 等非量化模块，避免它们在 LoQZO 中
-    # 被错误地全空间扰动，这是大模型训练变慢的主要原因之一。
-    qft_train_quantized_module_only: bool = True
 
     # -------------------- 日志 / wandb --------------------
     wandb_project: str = "LoQZO"
@@ -466,21 +491,30 @@ class OurArguments(TrainingArguments):
     loqzo_adaptive_rank: bool = False
     loqzo_rank_update_freq: int = 200
     loqzo_rank_ema: float = 0.9
-    loqzo_basis_init: str = "random_orth"  # random_orth / svd_weight
+    loqzo_basis_init: str = "random_normal"  # random_normal / random_orth / svd_weight
+    # -------------------- LoQZO / LoZO 风格子空间采样 --------------------
+    # False：V 初始化后固定，U 仍然每个 LoQZO step 重新采样；True：启用 LoZO lazy sampling，周期重采样 V。
+    loqzo_update_basis: bool = True
+    # V 固定的步数；默认 0 表示兼容旧参数 loqzo_u_update_freq。
+    loqzo_v_update_freq: int = 0
+    # 历史兼容旧脚本命名：当前实现中它等价于 V 的刷新周期。
+    loqzo_u_update_freq: int = 1000
+    # 以下两个参数仅为兼容旧命令行保留，当前实现不再用 W^T U 更新 V，也不再周期刷新 U。
+    loqzo_update_v_every_step: bool = True
+    loqzo_u_refresh_mode: str = ""
     loqzo_target_modules: Optional[str] = None
     loqzo_include_embeddings: bool = False
-    loqzo_fullspace_for_1d: bool = False
+    loqzo_fullspace_for_1d: bool = True
+    # True 时，凡是没有进入 rank-r 子空间的二维参数直接跳过，不再退化成全空间扰动。
+    # 这能避免 lm_head / embedding 等大矩阵被全空间 ZO 扰动，和“只在低秩子空间扰动权重”的算法设定更一致。
+    loqzo_skip_non_subspace_2d: bool = True
+    # 缓存当前 step 的低秩左因子 U，避免 +eps/-eps/restore/update 反复生成同一个 m*r 随机矩阵。
+    loqzo_cache_lowrank_coeff: bool = True
+    # 当 q1/q2 方向一致时，把“恢复原权重”和“应用更新”合并成一次 addmm_，减少一次低秩写入。
+    loqzo_fuse_restore_update: bool = True
+    # 兼容旧命名：当前量化对象是 LoZO 左因子 U；bits<=0 时复用 perturb_bits。
     loqzo_quantize_coeff: bool = True
     loqzo_coeff_bits: int = 0
-
-    # LoQZO 加速开关：
-    # - fast_lowrank_update=True 时，低秩方向使用 addmm_ 原地加到参数上，
-    #   不再先显式构造完整 delta 矩阵；
-    # - requantize_weight_every=0 时，更新后不再每步把 latent weight 重新量化一次，
-    #   因为 qft forward 本身已经会按 WBIT/ABIT 做前向量化。
-    #   若要严格复现“每步权重也压回 int 低比特”的旧行为，可设为 1。
-    loqzo_fast_lowrank_update: bool = True
-    loqzo_requantize_weight_every: int = 0
 
 
 def parse_args() -> OurArguments:
@@ -787,6 +821,9 @@ class Framework:
 
         with count_time("Loading model with FP%d" % (16 if self.args.load_float16 else 32)):
             config = AutoConfig.from_pretrained(model_source, **hf_common_kwargs)
+            if bool(getattr(self.args, "disable_train_use_cache", True)) and hasattr(config, "use_cache"):
+                # 训练只需要 loss，不需要返回 past_key_values。LLaMA/OPT 默认 use_cache=True 时会产生无用开销。
+                config.use_cache = False
 
             if self.args.untie_emb:
                 logger.warning("Untie embeddings and LM head")
@@ -852,6 +889,8 @@ class Framework:
                         **hf_common_kwargs,
                     )
 
+            if bool(getattr(self.args, "disable_train_use_cache", True)) and hasattr(model.config, "use_cache"):
+                model.config.use_cache = False
             model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=False, **hf_common_kwargs)
@@ -955,63 +994,83 @@ class Framework:
                 eos_token_id=[self.tokenizer.encode(args.eos_token, add_special_tokens=False)[-1], self.tokenizer.eos_token_id],
             )
             return self.tokenizer.decode(outputs[0][input_ids.size(1):], skip_special_tokens=True).strip()
-        return self.forward_candidates_batch([input_ids], [option_len])[0]
+        with torch.inference_mode():
+            self.model.eval()
+            logits = self.model(input_ids=input_ids).logits
+        labels = input_ids[0, 1:]
+        logits = logits[0, :-1]
+        log_probs = F.log_softmax(logits, dim=-1)
+        selected_log_probs = log_probs[torch.arange(len(labels)).to(labels.device), labels]
+        return selected_log_probs.cpu().detach()[-option_len:]
 
-    def forward_candidates_batch(self, encoded_candidates, option_lens):
+    def batch_forward_options(self, encoded_candidates, option_lens):
+        """批量计算多个 candidate 的 option log-prob，用于加速最终评估。
+
+        原 one_step_pred 会对同一个样本的每个 candidate 分别 forward；MultiRC/COPA/CB
+        等任务一个样本有多个 candidate，这会带来大量小 batch forward。这里把 candidate
+        合成一个 batch，并且在 fast_option_loss=True 时只对 option token 位置计算 lm_head。
+        该函数只影响评估，不改变训练更新公式。
         """
-        合批计算多个候选答案的 option-token log-prob。
+        features = [{"input_ids": ids} for ids in encoded_candidates]
+        batch = self.tokenizer.pad(
+            features,
+            padding=True,
+            pad_to_multiple_of=8,
+            return_tensors="pt",
+        )
+        device = self.model.device
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch.get("attention_mask", None)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
 
-        中文说明：
-        原来的评估逻辑对每个 candidate 单独 forward。ReCoRD 一个样本常有几十个
-        entity 候选，1000 个 eval 样本会变成数万次 forward，非常慢。这里把同一
-        样本的候选项按 eval_candidate_batch_size 合批，结果与逐候选 forward 等价，
-        但能显著减少 GPU kernel 启动和模型前向次数。
-        """
-        if len(encoded_candidates) == 0:
-            return []
+        option_lens_tensor = torch.as_tensor(option_lens, device=device, dtype=torch.long)
 
-        batch_size = max(1, int(getattr(self.args, "eval_candidate_batch_size", 16) or 16))
+        with torch.inference_mode():
+            self.model.eval()
+
+            # fast_option_loss=True 时，评估也复用“只算 option token logits”的路径。
+            # 对 decoder-only LM 来说，hidden_states[:, t] 对应预测 token t+1，
+            # 因此 option token 的 loss 只需要最后 option_len 个 shift 位置。
+            if bool(getattr(self.args, "fast_option_loss", False)) and hasattr(self.model, "model") and hasattr(self.model, "lm_head"):
+                backbone_outputs = self.model.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+                hidden_states = backbone_outputs[0]
+                shift_hidden = hidden_states[:, :-1, :]
+                shift_labels = input_ids[:, 1:].clone()
+                pad_token_id = getattr(self.model.config, "pad_token_id", None)
+                if pad_token_id is not None:
+                    shift_labels[shift_labels == pad_token_id] = -100
+
+                mask = torch.zeros_like(shift_labels, dtype=torch.bool)
+                for i, opt_len in enumerate(option_lens_tensor.tolist()):
+                    opt_len = max(0, int(opt_len))
+                    if opt_len > 0:
+                        mask[i, -opt_len:] = shift_labels[i, -opt_len:] != -100
+
+                active_hidden = shift_hidden[mask]
+                active_labels = shift_labels[mask]
+                if active_hidden.numel() == 0:
+                    return [torch.empty(0) for _ in encoded_candidates]
+
+                active_logits = self.model.lm_head(active_hidden)
+                active_log_probs = F.log_softmax(active_logits, dim=-1)
+                active_selected = active_log_probs.gather(-1, active_labels.unsqueeze(-1)).squeeze(-1)
+
+                row_ids = mask.nonzero(as_tuple=False)[:, 0]
+                outputs = []
+                for i in range(input_ids.size(0)):
+                    outputs.append(active_selected[row_ids == i].detach().cpu())
+                return outputs
+
+            logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+            labels = input_ids[:, 1:]
+            logits = logits[:, :-1, :]
+            log_probs = F.log_softmax(logits, dim=-1)
+            selected_log_probs = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+
         outputs = []
-        pad_id = self.tokenizer.pad_token_id
-        if pad_id is None:
-            pad_id = self.tokenizer.eos_token_id
-
-        self.model.eval()
-        # 和训练阶段保持一致，候选答案始终位于序列末尾；这样下面取 -option_len 才可靠。
-        old_padding_side = getattr(self.tokenizer, "padding_side", "left")
-        self.tokenizer.padding_side = "left"
-        for start in range(0, len(encoded_candidates), batch_size):
-            chunk_ids = encoded_candidates[start:start + batch_size]
-            chunk_lens = option_lens[start:start + batch_size]
-            features = [{"input_ids": ids} for ids in chunk_ids]
-            batch = self.tokenizer.pad(
-                features,
-                padding=True,
-                pad_to_multiple_of=8,
-                return_tensors="pt",
-            )
-            batch = {k: v.to(self.model.device) for k, v in batch.items()}
-
-            with torch.inference_mode():
-                logits = self.model(**batch).logits
-
-            input_ids = batch["input_ids"]
-            shift_labels = input_ids[:, 1:].contiguous()
-            shift_logits = logits[:, :-1, :].contiguous()
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-
-            safe_labels = shift_labels.clone()
-            safe_labels[safe_labels == pad_id] = 0
-            selected = torch.gather(log_probs, dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-
-            for row_id, opt_len in enumerate(chunk_lens):
-                opt_len = int(opt_len) if opt_len is not None else 0
-                if opt_len <= 0:
-                    outputs.append(selected[row_id, :0].cpu().detach())
-                else:
-                    outputs.append(selected[row_id, -opt_len:].cpu().detach())
-
-        self.tokenizer.padding_side = old_padding_side
+        for i, opt_len in enumerate(option_lens):
+            outputs.append(selected_log_probs[i, -int(opt_len):].detach().cpu())
         return outputs
 
     def one_step_pred(self, train_samples, eval_sample, verbose=False):
@@ -1055,21 +1114,36 @@ class Framework:
                 logger.info("Output: %s", output_text)
             return Prediction(correct_candidate=eval_sample.correct_candidate, predicted_candidate=output_text)
 
-        batch_selected_log_probs = self.forward_candidates_batch(encoded_candidates, option_lens)
-        if self.args.sfc or self.args.icl_sfc:
-            batch_sfc_selected_log_probs = self.forward_candidates_batch(sfc_encoded_candidates, sfc_option_lens)
+        if bool(getattr(self.args, "fast_eval_batch_options", False)):
+            batched_log_probs = self.batch_forward_options(encoded_candidates, option_lens)
+            if self.args.sfc or self.args.icl_sfc:
+                batched_sfc_log_probs = self.batch_forward_options(sfc_encoded_candidates, sfc_option_lens)
+            else:
+                batched_sfc_log_probs = [None] * len(encoded_candidates)
+
+            for candidate_id, encoded_candidate in enumerate(encoded_candidates):
+                selected_log_probs = batched_log_probs[candidate_id]
+                if verbose:
+                    logger.info("=== Candidate %d ===", candidate_id)
+                    logger.info(self.tokenizer.decode(encoded_candidate))
+                    logger.info("Log probabilities of the option tokens: %s", selected_log_probs)
+                outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": batched_sfc_log_probs[candidate_id]})
         else:
-            batch_sfc_selected_log_probs = [None] * len(batch_selected_log_probs)
+            for candidate_id, encoded_candidate in enumerate(encoded_candidates):
+                selected_log_probs = self.forward(encoded_candidate, option_len=option_lens[candidate_id])
+                if verbose:
+                    logger.info("=== Candidate %d ===", candidate_id)
+                    logger.info(self.tokenizer.decode(encoded_candidate))
+                    logger.info("Log probabilities of the option tokens: %s", selected_log_probs)
 
-        for candidate_id, encoded_candidate in enumerate(encoded_candidates):
-            selected_log_probs = batch_selected_log_probs[candidate_id]
-            if verbose:
-                logger.info("=== Candidate %d ===", candidate_id)
-                logger.info(self.tokenizer.decode(encoded_candidate))
-                logger.info("Log probabilities of the option tokens: %s", selected_log_probs)
+                if self.args.sfc or self.args.icl_sfc:
+                    sfc_selected_log_probs = self.forward(
+                        sfc_encoded_candidates[candidate_id], option_len=sfc_option_lens[candidate_id]
+                    )
+                else:
+                    sfc_selected_log_probs = None
 
-            sfc_selected_log_probs = batch_sfc_selected_log_probs[candidate_id]
-            outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs})
+                outputs.append({"log_probs": selected_log_probs, "sfc_log_probs": sfc_selected_log_probs})
 
         if self.args.sfc or self.args.icl_sfc:
             scores = [x["log_probs"].sum().item() - x["sfc_log_probs"].sum().item() for x in outputs]
@@ -1171,6 +1245,10 @@ class Framework:
             eval_dataset = HFDataset(self._convert_samples(eval_or_dev_samples))
 
         if self.args.only_train_option and not self.args.non_diff:
+            # 中文说明：训练时只需要 option token 的 loss。fast_option_loss=True 时，
+            # forward_wrap 会绕过整段 prompt 的 full-vocab logits，只对 option token 位置调用 lm_head。
+            # 该开关仅由交替脚本显式打开，普通 baseline 默认保持旧路径。
+            self.model.fast_option_loss = bool(getattr(self.args, "fast_option_loss", False))
             self.model.original_forward = self.model.forward
             self.model.forward = forward_wrap_with_option_len.__get__(self.model, type(self.model))
 
@@ -1185,42 +1263,36 @@ class Framework:
             self.model = quantize_model(self.model)
             enable_quantization(self.model)
 
-            # 中文说明：
-            # 旧代码在 qft_freeze_alpha=True 时把所有非 alpha 参数都设为可训练，
-            # 这会把 embed_tokens / lm_head / norm 等未被量化包装的参数也纳入 LoQZO。
-            # 这些大矩阵随后会走全空间扰动，LLaMA-2 7B 上会极大拖慢训练。
-            # 这里默认只训练 LinearQuantizer 内部的 weight/bias；QZO 的 alpha 虽然
-            # requires_grad=False，但仍会在 trainer_alternating.py 中被手动零阶更新。
-            quantized_param_ids = set()
-            quantized_linear_count = 0
-            if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
+            if bool(getattr(self.args, "qft_train_quantized_linear_only", False)):
+                # 中文说明：交替 LoQZO+QZO 只需要优化被量化包装后的 Linear 权重，
+                # alpha 由 QZO 阶段手动更新，lm_head/embedding/norm 等未量化参数不参与。
+                # 这样不会影响其它 baseline；只有脚本显式打开该开关时才生效。
+                for _, param in self.model.named_parameters():
+                    param.requires_grad = False
+                train_bias = bool(getattr(self.args, "qft_train_bias", False))
+                enabled_weights = 0
+                enabled_bias = 0
                 for module in self.model.modules():
                     if isinstance(module, LinearQuantizer):
-                        quantized_linear_count += 1
-                        quantized_param_ids.add(id(module.weight))
-                        if getattr(module, "bias", None) is not None:
-                            quantized_param_ids.add(id(module.bias))
-
-            for name, param in self.model.named_parameters():
-                is_alpha = ("alpha" in name)
-                in_quantized_module = id(param) in quantized_param_ids
-                if self.args.qft_alpha_only:
-                    param.requires_grad = is_alpha
-                elif self.args.qft_freeze_alpha:
-                    if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
-                        param.requires_grad = in_quantized_module
-                    else:
-                        param.requires_grad = not is_alpha
-                else:
-                    if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
-                        param.requires_grad = in_quantized_module or is_alpha
+                        if hasattr(module, "weight") and module.weight is not None:
+                            module.weight.requires_grad = True
+                            enabled_weights += module.weight.numel()
+                        if train_bias and getattr(module, "bias", None) is not None:
+                            module.bias.requires_grad = True
+                            enabled_bias += module.bias.numel()
+                logger.info(
+                    "qft_train_quantized_linear_only=True：仅训练量化 Linear 权重；weight_params=%s | bias_params=%s",
+                    f"{enabled_weights:,}",
+                    f"{enabled_bias:,}",
+                )
+            else:
+                for name, param in self.model.named_parameters():
+                    if self.args.qft_alpha_only:
+                        param.requires_grad = ("alpha" in name)
+                    elif self.args.qft_freeze_alpha:
+                        param.requires_grad = ("alpha" not in name)
                     else:
                         param.requires_grad = True
-
-            if bool(getattr(self.args, "qft_train_quantized_module_only", True)):
-                logger.info("qft 训练范围：仅 LinearQuantizer weight/bias；量化线性层数量=%d", quantized_linear_count)
-            else:
-                logger.info("qft 训练范围：旧逻辑，所有非 alpha 参数均可训练。")
 
         trainable_num = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_num = sum(p.numel() for p in self.model.parameters())

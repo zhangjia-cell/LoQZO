@@ -79,7 +79,7 @@ class DatasetSpec:
 # 你当前需要的模型列表
 # ============================================================
 # 说明：
-# - OPT-1.3B / 2.7B / 13B / 30B：直接下载 base checkpoint
+# - OPT-1.3B / 2.7B / 6.7B / 13B / 30B：直接下载 base checkpoint
 # - RoBERTa-Large：直接下载 base checkpoint（公开模型）
 # - Llama2-7B / 13B：直接下载 base checkpoint（需要 token + 访问权限）
 # - Llama2-7B / 13B 的 8bit / 4bit：下载同一个 base model，并生成量化加载 manifest
@@ -90,6 +90,7 @@ class DatasetSpec:
 REQUESTED_MODELS: List[ModelSpec] = [
     ModelSpec("OPT-1.3B", "facebook/opt-1.3b"),
     ModelSpec("OPT-2.7B", "facebook/opt-2.7b"),
+    ModelSpec("OPT-6.7B", "facebook/opt-6.7b"),
     ModelSpec("OPT-13B", "facebook/opt-13b"),
     ModelSpec("OPT-30B", "facebook/opt-30b"),
 
@@ -185,7 +186,6 @@ MODEL_IGNORE_PATTERNS = [
 # ============================================================
 # 工具函数
 # ============================================================
-
 
 def eprint(*args: object) -> None:
     """打印到 stderr。"""
@@ -372,7 +372,6 @@ def quantization_manifest(spec: ModelSpec, base_dir: Path) -> Dict[str, object]:
 # 模型下载逻辑
 # ============================================================
 
-
 def download_models(
     models_dir: Path,
     token: Optional[str],
@@ -398,6 +397,14 @@ def download_models(
     if not requested:
         print("[models] 没有模型匹配 --only-models 过滤条件，跳过模型下载。")
         return
+
+    unknown_aliases = set()
+    if selected_aliases is not None:
+        known_aliases = {m.alias for m in REQUESTED_MODELS}
+        unknown_aliases = selected_aliases - known_aliases
+
+    if unknown_aliases:
+        eprint(f"[models] 警告：以下模型别名不存在，将被忽略: {sorted(unknown_aliases)}")
 
     unique_repo_ids = sorted({m.repo_id for m in requested})
     repo_to_dir: Dict[str, Path] = {}
@@ -479,7 +486,6 @@ def download_models(
 # 数据集下载逻辑
 # ============================================================
 
-
 def download_datasets(
     data_dir: Path,
     dataset_profile: str,
@@ -507,6 +513,14 @@ def download_datasets(
     if not specs:
         print("[datasets] 没有数据集匹配过滤条件，跳过数据集下载。")
         return
+
+    unknown_aliases = set()
+    if selected_aliases is not None:
+        known_aliases = {d.alias for d in DATASET_PROFILES[dataset_profile]}
+        unknown_aliases = selected_aliases - known_aliases
+
+    if unknown_aliases:
+        eprint(f"[datasets] 警告：以下数据集别名不存在，将被忽略: {sorted(unknown_aliases)}")
 
     index = []
     for spec in specs:
@@ -565,7 +579,6 @@ def download_datasets(
 # 命令行参数
 # ============================================================
 
-
 def build_argparser() -> argparse.ArgumentParser:
     """构造命令行参数解析器。"""
 
@@ -614,7 +627,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "只下载指定模型别名。"
             "可以写空格分隔，也可以写逗号分隔。"
-            "例如：--only-models OPT-1.3B RoBERTa-Large Llama2-7B-8bit Llama3-8B-4bit"
+            "例如：--only-models OPT-1.3B OPT-6.7B RoBERTa-Large Llama2-7B-8bit Llama3-8B-4bit"
         ),
     )
     parser.add_argument(
@@ -650,7 +663,6 @@ def build_argparser() -> argparse.ArgumentParser:
 # ============================================================
 # 主函数
 # ============================================================
-
 
 def main() -> None:
     """脚本入口。"""
@@ -744,31 +756,36 @@ if __name__ == "__main__":
 #
 # 6）只下载部分模型：
 #    HF_TOKEN=你的token python download_quzo_assets.py \
-#        --only-models OPT-1.3B RoBERTa-Large OPT-13B Llama2-7B Llama3-8B-4bit
+#        --only-models OPT-1.3B OPT-6.7B RoBERTa-Large OPT-13B Llama2-7B Llama3-8B-4bit
 #
-# 7）只下载 Llama2 量化模型入口：
+# 7）只下载 OPT-6.7B：
+#    python download_quzo_assets.py \
+#        --skip-datasets \
+#        --only-models OPT-6.7B
+#
+# 8）只下载 Llama2 量化模型入口：
 #    HF_TOKEN=你的token python download_quzo_assets.py \
 #        --skip-datasets \
 #        --only-models Llama2-7B-8bit Llama2-7B-4bit Llama2-13B-8bit Llama2-13B-4bit
 #
-# 8）只下载部分数据集：
+# 9）只下载部分数据集：
 #    python download_quzo_assets.py --only-datasets sst2 rte squad drop
 #
-# 9）如果你不想依赖自动推断项目根目录，也可以手动指定：
-#    HF_TOKEN=你的token python download_quzo_assets.py \
-#        --project-root /你的项目根目录
+# 10）如果你不想依赖自动推断项目根目录，也可以手动指定：
+#     HF_TOKEN=你的token python download_quzo_assets.py \
+#         --project-root /你的项目根目录
 #
-# 10）如果你只想下载 RoBERTa-Large：
+# 11）如果你只想下载 RoBERTa-Large：
 #     python download_quzo_assets.py \
 #         --skip-datasets \
 #         --only-models RoBERTa-Large
 #
-# 11）关于是否必须登录 Hugging Face：
+# 12）关于是否必须登录 Hugging Face：
 #     - 公开模型 / 公开数据集：通常不强制要求登录。
 #     - Meta Llama 2 / Llama 3：必须先在网页上获得访问权限，并使用 token。
 #     - 你既然已经有 Hugging Face 账号和 token，建议直接用 token，最稳妥。
 #
-# 12）目录说明：
+# 13）目录说明：
 #     - base model 会下载到：Models/base_models/
 #     - 8bit / 4bit manifest 会保存到：Models/quantized_manifests/
 #     - 数据集 save_to_disk 结果会保存到：Data/hf_saved/

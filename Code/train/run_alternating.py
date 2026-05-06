@@ -133,6 +133,9 @@ def _normalize_alternating_args(args: OurArguments) -> None:
             logger.warning("qft_alpha_only=True 会导致 LoQZO 阶段没有权重可更新；已自动改为 False。")
         args.qft_alpha_only = False
         args.qft_freeze_alpha = True
+        # 只让被量化包装的 Linear 权重参与 LoQZO；lm_head/embedding/norm 等未量化参数不做全空间扰动。
+        if hasattr(args, "qft_train_quantized_linear_only"):
+            args.qft_train_quantized_linear_only = True
 
     # 5) 交替步数合法化。
     args.alt_a_steps = max(0, int(args.alt_a_steps))
@@ -188,9 +191,46 @@ def main(default_overrides: Optional[Dict[str, Any]] = None) -> None:
         args.mode,
     )
     logger.info("  loqzo_rank = %s | adaptive_rank = %s | basis_init = %s", args.loqzo_rank, args.loqzo_adaptive_rank, args.loqzo_basis_init)
+    effective_v_freq = getattr(args, "loqzo_v_update_freq", 0) or getattr(args, "loqzo_u_update_freq", 1000)
+    logger.info(
+        "  loqzo_lazy_sampling = %s | sample_U = every_step | v_update_freq = %s | legacy_u_update_freq = %s",
+        getattr(args, "loqzo_update_basis", False),
+        effective_v_freq,
+        getattr(args, "loqzo_u_update_freq", 1000),
+    )
     logger.info("  qzo_eps = %s | qzo_scale_lr_mult = %s | qzo_scope = %s", args.qzo_eps or args.zo_eps, args.qzo_scale_lr_mult, args.qzo_scale_scope)
     logger.info("  qzo_scale_min = %s | qzo_scale_max = %s | qzo_scale_max_mult = %s", args.qzo_scale_min, args.qzo_scale_max, args.qzo_scale_max_mult)
     logger.info("  clip_zo_grad = %s | qzo_clip_threshold = %s", args.clip_zo_grad, args.qzo_clip_threshold)
+    logger.info(
+        "  speed flags | skip_post_update_forward=%s | cache_trainable_params=%s | loqzo_fast_addmm=%s | qzo_cache_scale_params=%s | qzo_cache_scale_deltas=%s",
+        getattr(args, "skip_post_update_forward", True),
+        getattr(args, "cache_trainable_params", True),
+        getattr(args, "loqzo_fast_addmm", True),
+        getattr(args, "qzo_cache_scale_params", True),
+        getattr(args, "qzo_cache_scale_deltas", True),
+    )
+    logger.info(
+        "  speed extra | prepare_inputs_once=%s | fast_eval_mode=%s | disable_train_use_cache=%s | "
+        "qft_linear_only=%s | fullspace_1d=%s | skip_non_subspace_2d=%s | cache_coeff=%s | fuse_restore_update=%s",
+        getattr(args, "prepare_inputs_once_for_zo", True),
+        getattr(args, "fast_zo_eval_mode", True),
+        getattr(args, "disable_train_use_cache", True),
+        getattr(args, "qft_train_quantized_linear_only", False),
+        getattr(args, "loqzo_fullspace_for_1d", True),
+        getattr(args, "loqzo_skip_non_subspace_2d", True),
+        getattr(args, "loqzo_cache_lowrank_coeff", True),
+        getattr(args, "loqzo_fuse_restore_update", True),
+    )
+    logger.info(
+        "  speed v3 | fast_option_loss=%s | fast_eval_batch_options=%s | skip_flos=%s | "
+        "disable_nan_inf_filter=%s | fast_int_quant=%s | no_outlier=%s",
+        getattr(args, "fast_option_loss", False),
+        getattr(args, "fast_eval_batch_options", False),
+        getattr(args, "skip_flos_meter_for_zo", False),
+        getattr(args, "disable_nan_inf_filter_for_zo", False),
+        getattr(args, "fast_int_quant", False),
+        getattr(args, "no_outlier", False),
+    )
     logger.info("====================================================")
 
     logger.info("当前可见 GPU 数量: %s", torch.cuda.device_count())

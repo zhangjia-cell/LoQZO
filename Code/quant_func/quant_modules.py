@@ -8,9 +8,23 @@ import quant_cuda
 class QuantBase():
     def _quantization(x, quant_grid):
         shape = x.shape
-        quant_array = x.reshape(-1)
-        quant_grid = quant_grid.type_as(quant_array)
-        quant_array, _ = quant_cuda.quant(quant_array, quant_grid)
+        quant_array = x.reshape(-1).contiguous()
+
+        # 中文说明：quant_cuda 当前 CUDA 扩展只通过 AT_DISPATCH_FLOATING_TYPES
+        # 支持 float32/float64，不支持 torch.float16 / torch.bfloat16。
+        # 为了让 LLaMA-2 这类模型可以用 BF16/FP16 加载来提速，这里在量化核内部临时转成
+        # float32 做 nearest-codebook 查询，再转回原 dtype。这样 Data Precision 仍由 WBIT/ABIT/WMODE/AMODE 控制，
+        # LOAD_BFLOAT16/LOAD_FLOAT16 只影响底层矩阵乘 dtype。
+        orig_dtype = quant_array.dtype
+        if orig_dtype not in (torch.float32, torch.float64):
+            quant_array_for_cuda = quant_array.float().contiguous()
+            quant_grid_for_cuda = quant_grid.float().contiguous()
+            quant_array_for_cuda, _ = quant_cuda.quant(quant_array_for_cuda, quant_grid_for_cuda)
+            quant_array = quant_array_for_cuda.to(dtype=orig_dtype)
+        else:
+            quant_grid = quant_grid.type_as(quant_array).contiguous()
+            quant_array, _ = quant_cuda.quant(quant_array, quant_grid)
+
         quant_array = quant_array.view(shape)
         return quant_array
 
@@ -39,6 +53,8 @@ class Quantizer(nn.Module):
         self.a_low = self.args.a_low
 
         self.alpha = nn.Parameter(torch.tensor(1.0, requires_grad=True))
+        # Python 侧缓存 bit 宽，避免每次 forward 对 GPU buffer 调 .item()。
+        self.bit_width_py = int(bit)
         self.register_buffer('bit', torch.tensor(bit,dtype=torch.int))
         self.register_buffer('has_inited_quant_para', torch.tensor(0.0,dtype=torch.int))
         self.register_buffer('quant_grid', torch.ones(2**bit))
@@ -53,6 +69,11 @@ class Quantizer(nn.Module):
 
         ## debug
         self.name = None
+
+        # 中文说明：has_inited_quant_para 是 GPU buffer。旧代码每次 forward 用它做 Python if，
+        # 会触发 GPU->CPU 同步；大模型每层每次 forward 都同步会明显拖慢训练。
+        # 这里增加 Python bool 作为快速路径，buffer 仍保留给旧接口 / checkpoint 使用。
+        self._quant_initialized_py = False
 
     def disable_input_quantization(self):
         self.is_enable_activation = False
@@ -303,8 +324,20 @@ class Quantizer(nn.Module):
 
     @torch.no_grad()
     def _init_quant_para(self, data, data_b):
-        with torch.no_grad():                    
-            if self.has_inited_quant_para == 0:
+        with torch.no_grad():
+            # 初始化完成后直接返回，避免每个 forward 读取 GPU 标量 buffer。
+            if self._quant_initialized_py:
+                return
+
+            # 兼容从 checkpoint 恢复、或旧接口手动设置 has_inited_quant_para 的情况。
+            try:
+                if bool(self.has_inited_quant_para.detach().cpu().item() != 0):
+                    self._quant_initialized_py = True
+                    return
+            except Exception:
+                pass
+
+            if not self._quant_initialized_py:
                 self.update_signed(data)                
                 self.outliers.data = self.outlier_value()
 
@@ -338,9 +371,55 @@ class Quantizer(nn.Module):
                 print("%d-bit \t %s," %(self.bit.item(), self.name))
                 
                 self.has_inited_quant_para.data = torch.ones_like(self.has_inited_quant_para)
+                self._quant_initialized_py = True
          
+    @torch.no_grad()
+    def _forward_int_uniform(self, data):
+        """int codebook + no_outlier=True 时的等价快速量化路径。
+
+        原路径会把每个元素送入 quant_cuda，与完整 codebook 做 nearest-neighbor 查找。
+        当 mode=int 且 no_outlier=True 时，codebook 是等间距整数网格，最近邻量化可以直接用
+        round + clamp 表达，避免每个 forward 对整层权重做通用 codebook 搜索。
+        该路径只在 args.fast_int_quant=True 且 args.no_outlier=True 时启用，因此不会影响默认 baseline。
+        """
+        orig_dtype = data.dtype
+        bit_width = int(getattr(self, "bit_width_py", 8))
+        b = bit_width - 1 if self.is_signed else bit_width
+        step = 32.0 / float(2 ** b)
+        qmax = step * float((2 ** b) - 1)
+        qmin = -qmax if self.is_signed else 0.0
+
+        # 与旧实现一致：scale = alpha / max(quant_grid)，量化发生在 data / scale 的归一化空间。
+        scale = self.alpha / qmax
+        if self.is_perchannel:
+            x = (data.view(data.shape[0], -1) / scale).view(data.shape)
+        else:
+            x = data / scale
+
+        q = torch.round(x / step) * step
+        q = torch.clamp(q, min=qmin, max=qmax)
+        tensor = (q - x).detach() + x
+
+        if self.is_perchannel:
+            tensor = (tensor.view(tensor.shape[0], -1) * scale).view(data.shape)
+        else:
+            tensor = tensor * scale
+        if tensor.dtype != orig_dtype:
+            tensor = tensor.to(dtype=orig_dtype)
+        return tensor
+
     @torch.no_grad()   
     def _forward(self, data, display=False):
+        # mode=int 且 no_outlier=True 时，使用 round/clamp 快速路径；
+        # 否则保留通用 quant_cuda codebook 路径，保证旧实验语义不变。
+        if (
+            self.mode == "int"
+            and bool(getattr(self.args, "fast_int_quant", True))
+            and bool(getattr(self.args, "no_outlier", False))
+        ):
+            return self._forward_int_uniform(data)
+
+        orig_dtype = data.dtype
         scale = self.alpha / torch.max(self.quant_grid)
         
         if self.is_perchannel: 
@@ -375,6 +454,10 @@ class Quantizer(nn.Module):
         else:
             tensor = tensor * scale
 
+        # 若模型底层以 BF16/FP16 加载，量化内部可用 FP32 做 codebook 查询，
+        # 但返回给 F.linear/Conv 的仍保持原 dtype，以便使用 Tensor Core 加速。
+        if tensor.dtype != orig_dtype:
+            tensor = tensor.to(dtype=orig_dtype)
         return tensor
 
     @torch.no_grad()
@@ -527,10 +610,11 @@ class LinearQuantizer(nn.Module):
 
         if self.quant_weight is not None:
             # 权重量化采用 per-output-channel scale，shape=[out_features, 1]
+            # alpha/scale 由 QZO 手动更新，保持 FP32 可以避免 BF16/FP16 下 lr 很小时更新被舍入掉。
             self.quant_weight.alpha.data = torch.ones(
                 [self.out_features, 1],
                 device=weight_data.device,
-                dtype=weight_data.dtype,
+                dtype=torch.float32,
             )
 
         try:

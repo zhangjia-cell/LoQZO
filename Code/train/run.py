@@ -418,7 +418,12 @@ class OurArguments(TrainingArguments):
     loqzo_adaptive_rank: bool = False
     loqzo_rank_update_freq: int = 200
     loqzo_rank_ema: float = 0.9
-    loqzo_basis_init: str = "random_orth"  # random_orth / svd_weight
+    loqzo_basis_init: str = "random_normal"  # random_normal / random_orth / svd_weight
+    loqzo_update_basis: bool = True
+    loqzo_v_update_freq: int = 0
+    loqzo_u_update_freq: int = 1000
+    loqzo_update_v_every_step: bool = True
+    loqzo_u_refresh_mode: str = ""
     loqzo_target_modules: Optional[str] = None
     loqzo_include_embeddings: bool = False
     loqzo_fullspace_for_1d: bool = True

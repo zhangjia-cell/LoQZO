@@ -124,6 +124,8 @@ def set_8_bit_layer_l(model, layer_list):
         if isinstance(m, TensorQuantizer):
             module_list += [m]
             m.has_inited_quant_para.data = torch.zeros_like(m.has_inited_quant_para)
+            if hasattr(m, "_quant_initialized_py"):
+                m._quant_initialized_py = False
 
     if _dist_rank_or_zero() == 0:
         print("------------- 8-bit Re-SET -------------")
@@ -152,6 +154,8 @@ def set_8_bit_layer_n(model, l_num):
             module_list += [m]
             mse_list += [m.mse.item()]
             m.has_inited_quant_para.data = torch.zeros_like(m.has_inited_quant_para)
+            if hasattr(m, "_quant_initialized_py"):
+                m._quant_initialized_py = False
 
     print("------------- 8-bit Re-SET -------------")
     print(l_num)

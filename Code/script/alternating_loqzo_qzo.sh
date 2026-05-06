@@ -133,7 +133,7 @@ unset BNB_CUDA_VERSION
 # PREFER_LOCAL_MODEL 推荐保持 False，避免 MODEL=facebook/opt-1.3b 被模糊匹配到 opt-13b。
 # ============================================================
 MODEL=${MODEL:-facebook/opt-1.3b}
-MODEL_PATH=${MODEL_PATH:-/home/zhangjia/Code/LoQZO/LoQZO/Models/base_models/meta-llama--Llama-2-7b-hf}
+MODEL_PATH=${MODEL_PATH:-/root/NeurIPS2026/Models/base_models/meta-llama--Llama-2-7b-hf}
 PREFER_LOCAL_MODEL=${PREFER_LOCAL_MODEL:-False}
 
 # ============================================================
@@ -250,20 +250,16 @@ EPOCHS=${EPOCHS:-${TRAIN_EPOCHS:-0}}
 SAVE_STEPS=${SAVE_STEPS:-50000}
 LOGGING_STEPS=${LOGGING_STEPS:-20}
 EVAL_STEPS=${EVAL_STEPS:-1000}
+# FAST_TASK_LENGTH=True 时，如果用户没有显式传 MAX_LENGTH，脚本会按任务给更省时的默认长度。
+# 需要完全复现旧设置时，显式传 FAST_TASK_LENGTH=False MAX_LENGTH=512。
+MAX_LENGTH_USER_SET=0
+if [[ -n "${MAX_LENGTH+x}" ]]; then
+  MAX_LENGTH_USER_SET=1
+fi
+FAST_TASK_LENGTH=${FAST_TASK_LENGTH:-True}
 MAX_LENGTH=${MAX_LENGTH:-512}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-32}
 NO_EVAL=${NO_EVAL:-False}
 EVAL_DURING_TRAINING=${EVAL_DURING_TRAINING:-False}
-# 训练后评估是否使用 few-shot demonstrations。
-# 原脚本固定使用 32 个 demo；在 ReCoRD/SQuAD/DROP/MultiRC 这类长文本任务上，
-# 每个 eval 样本都会反复拼接和 tokenize 这些长 demo，CPU 和 GPU 都会变慢。
-# 微调后的正式评估一般设为 0-shot，因此默认关闭；如需旧行为可设 True 和 32。
-USE_EVAL_DEMOS_AFTER_TRAINING=${USE_EVAL_DEMOS_AFTER_TRAINING:-False}
-EVAL_NUM_DEMOS=${EVAL_NUM_DEMOS:-0}
-EVAL_DEMO_SEED=${EVAL_DEMO_SEED:-0}
-# 多候选评估合批大小。ReCoRD 一个样本可能有几十个 entity 候选，
-# 逐候选 forward 会非常慢；16/32 通常更合适。
-EVAL_CANDIDATE_BATCH_SIZE=${EVAL_CANDIDATE_BATCH_SIZE:-16}
 OVERWRITE_OUTPUT_DIR=${OVERWRITE_OUTPUT_DIR:-False}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 
@@ -299,6 +295,18 @@ case "$TASK_LOWER" in
   wikitext)
     DEFAULT_TRAIN=1000; DEFAULT_DEV=0; DEFAULT_EVAL=1000 ;;
 esac
+# 根据任务自动压缩默认输入长度。
+# 说明：MultiRC/BoolQ 等阅读类分类任务在 LLaMA-2-7B 上用 512 会非常慢；
+# 默认 256 能明显降低训练时长。若论文实验需要固定 512，请显式设置 MAX_LENGTH=512 或 FAST_TASK_LENGTH=False。
+if [[ "$MAX_LENGTH_USER_SET" == "0" && ("$FAST_TASK_LENGTH" == "True" || "$FAST_TASK_LENGTH" == "true") ]]; then
+  case "$TASK_LOWER" in
+    multirc|multi_rc|boolq|rte|wic|wsc|wsc.fixed|cb|copa|sst2|sst-2|winogrande)
+      MAX_LENGTH=256 ;;
+    record|recordd|record_task|record_dataset|squad|squad_v1|squad1|drop)
+      MAX_LENGTH=512 ;;
+  esac
+fi
+
 TRAIN=${TRAIN:-$DEFAULT_TRAIN}
 DEV=${DEV:-$DEFAULT_DEV}
 EVAL=${EVAL:-$DEFAULT_EVAL}
@@ -394,12 +402,57 @@ esac
 
 PBIT=${PBIT:-4}
 NO_OUTLIER=${NO_OUTLIER:-False}
+
+# -------------------- 大模型加载精度 / 速度 --------------------
+# Data Precision 仍由 PRECISION_PROFILE 控制；这里的 LOAD_BFLOAT16/LOAD_FLOAT16 只是“原始模型加载 dtype”。
+# A100 上 LLaMA/Mistral/OPT-6.7B+ 用 BF16 通常比 FP32 更快、更省显存，且不等于加载外部量化模型。
+LOAD_FLOAT16_USER_SET=0
+LOAD_BFLOAT16_USER_SET=0
+if [[ -n "${LOAD_FLOAT16+x}" ]]; then LOAD_FLOAT16_USER_SET=1; fi
+if [[ -n "${LOAD_BFLOAT16+x}" ]]; then LOAD_BFLOAT16_USER_SET=1; fi
+AUTO_BF16_FOR_LARGE_MODEL=${AUTO_BF16_FOR_LARGE_MODEL:-True}
 LOAD_FLOAT16=${LOAD_FLOAT16:-False}
 LOAD_BFLOAT16=${LOAD_BFLOAT16:-False}
+MODEL_LOWER_FOR_DTYPE=$(echo "$MODEL" | tr '[:upper:]' '[:lower:]')
+if [[ "$AUTO_BF16_FOR_LARGE_MODEL" == "True" || "$AUTO_BF16_FOR_LARGE_MODEL" == "true" ]]; then
+  if [[ "$LOAD_FLOAT16_USER_SET" == "0" && "$LOAD_BFLOAT16_USER_SET" == "0" ]]; then
+    case "$MODEL_LOWER_FOR_DTYPE" in
+      *llama*|*mistral*|*opt-6.7b*|*opt-13b*|*opt-30b*)
+        LOAD_BFLOAT16=True ;;
+    esac
+  fi
+fi
 LOAD_INT8=${LOAD_INT8:-False}
 LOAD_INT4=${LOAD_INT4:-False}
 GRADIENT_CHECKPOINTING=${GRADIENT_CHECKPOINTING:-False}
 FORCE_DISABLE_BNB=${FORCE_DISABLE_BNB:-False}
+
+# -------------------- ZO/LoQZO 加速开关 --------------------
+# 这些开关不改变 LoQZO/QZO 的数学更新；主要减少多余 forward、参数遍历和完整 delta 分配。
+SKIP_POST_UPDATE_FORWARD=${SKIP_POST_UPDATE_FORWARD:-True}
+CACHE_TRAINABLE_PARAMS=${CACHE_TRAINABLE_PARAMS:-True}
+LOQZO_FAST_ADDMM=${LOQZO_FAST_ADDMM:-True}
+QZO_CACHE_SCALE_PARAMS=${QZO_CACHE_SCALE_PARAMS:-True}
+QZO_CACHE_SCALE_DELTAS=${QZO_CACHE_SCALE_DELTAS:-True}
+# 同一个 ZO step 的 +eps/-eps 两次 forward 复用已经搬到 GPU 的 batch，避免重复 CPU->GPU 拷贝。
+PREPARE_INPUTS_ONCE_FOR_ZO=${PREPARE_INPUTS_ONCE_FOR_ZO:-True}
+# ZO forward 中模型一直是 eval，避免每次 forward 递归 model.eval()。
+FAST_ZO_EVAL_MODE=${FAST_ZO_EVAL_MODE:-True}
+# 训练 loss 不需要 past_key_values，关闭 use_cache 避免无用 KV cache。
+DISABLE_TRAIN_USE_CACHE=${DISABLE_TRAIN_USE_CACHE:-True}
+# qft 时只训练被量化包装后的 Linear 权重，冻结 lm_head/embedding/norm 等未量化参数，避免全空间扰动。
+QFT_TRAIN_QUANTIZED_LINEAR_ONLY=${QFT_TRAIN_QUANTIZED_LINEAR_ONLY:-True}
+QFT_TRAIN_BIAS=${QFT_TRAIN_BIAS:-False}
+# 训练时只对 option token 位置计算 lm_head/log_softmax，避免整段 prompt 的 full-vocab logits。
+# 对 only_train_option=True 的分类/多选任务有效；生成任务自动不受影响。
+FAST_OPTION_LOSS=${FAST_OPTION_LOSS:-True}
+# 评估时把同一个样本的多个 candidate 合成 batch，并复用 FAST_OPTION_LOSS 路径。
+FAST_EVAL_BATCH_OPTIONS=${FAST_EVAL_BATCH_OPTIONS:-True}
+# ZO 大模型训练时关闭每 step FLOPs 统计和 NaN/Inf Tensor bool 检查，避免 GPU 同步。
+SKIP_FLOS_METER_FOR_ZO=${SKIP_FLOS_METER_FOR_ZO:-True}
+DISABLE_NAN_INF_FILTER_FOR_ZO=${DISABLE_NAN_INF_FILTER_FOR_ZO:-True}
+# int + no_outlier=True 时启用 round/clamp 快速量化路径；不设 NO_OUTLIER 时不会改变原通用 codebook 路径。
+FAST_INT_QUANT=${FAST_INT_QUANT:-True}
 
 # -------------------- LoQZO 低秩子空间参数 --------------------
 LOQZO_ENABLE=${LOQZO_ENABLE:-True}
@@ -410,22 +463,25 @@ LOQZO_RANK_MAX=${LOQZO_RANK_MAX:-64}
 LOQZO_RANK_BUDGET=${LOQZO_RANK_BUDGET:-0}
 LOQZO_RANK_UPDATE_FREQ=${LOQZO_RANK_UPDATE_FREQ:-200}
 LOQZO_RANK_EMA=${LOQZO_RANK_EMA:-0.9}
-LOQZO_BASIS_INIT=${LOQZO_BASIS_INIT:-random_orth}  # random_orth / svd_weight
+LOQZO_BASIS_INIT=${LOQZO_BASIS_INIT:-random_normal}  # random_normal / random_orth / svd_weight
+# LoZO 风格 lazy sampling：默认开启。
+# 含义：U 每个 LoQZO step 按当前 ZO seed 重新采样；V 每 LOQZO_V_UPDATE_FREQ 个 LoQZO step 重新采样。
+LOQZO_UPDATE_BASIS=${LOQZO_UPDATE_BASIS:-True}
+LOQZO_V_UPDATE_FREQ=${LOQZO_V_UPDATE_FREQ:-0}
+# 兼容旧环境变量名：当 LOQZO_V_UPDATE_FREQ=0 时，Python 端会读取 LOQZO_U_UPDATE_FREQ 作为 V 的刷新周期。
+LOQZO_U_UPDATE_FREQ=${LOQZO_U_UPDATE_FREQ:-1000}
+LOQZO_UPDATE_V_EVERY_STEP=${LOQZO_UPDATE_V_EVERY_STEP:-True}
+LOQZO_U_REFRESH_MODE=${LOQZO_U_REFRESH_MODE:-}
 LOQZO_TARGET_MODULES=${LOQZO_TARGET_MODULES:-}
 LOQZO_INCLUDE_EMBEDDINGS=${LOQZO_INCLUDE_EMBEDDINGS:-False}
-# 默认不再对 1D norm/bias 做全空间扰动；主算法聚焦线性层权重。
+# 默认不再对 bias / norm 等一维参数做全空间扰动；你的算法重点是二维权重矩阵的 rank-r 子空间。
 LOQZO_FULLSPACE_FOR_1D=${LOQZO_FULLSPACE_FOR_1D:-False}
+# 默认跳过没有进入子空间的二维大矩阵，比如 lm_head / embedding，避免退化成全空间 ZO。
+LOQZO_SKIP_NON_SUBSPACE_2D=${LOQZO_SKIP_NON_SUBSPACE_2D:-True}
+LOQZO_CACHE_LOWRANK_COEFF=${LOQZO_CACHE_LOWRANK_COEFF:-True}
+LOQZO_FUSE_RESTORE_UPDATE=${LOQZO_FUSE_RESTORE_UPDATE:-True}
 LOQZO_QUANTIZE_COEFF=${LOQZO_QUANTIZE_COEFF:-True}
 LOQZO_COEFF_BITS=${LOQZO_COEFF_BITS:-0}
-# 加速开关：低秩方向用 addmm_ 原地更新，不显式构造完整 delta。
-LOQZO_FAST_LOWRANK_UPDATE=${LOQZO_FAST_LOWRANK_UPDATE:-True}
-# 更新后每隔多少步把 latent weight 再量化一次。0 表示关闭。
-# qft forward 已经会按 WBIT/ABIT 做量化前向；每步再量化所有大矩阵会非常慢。
-LOQZO_REQUANTIZE_WEIGHT_EVERY=${LOQZO_REQUANTIZE_WEIGHT_EVERY:-0}
-# qft 只训练被 LinearQuantizer 包装的线性层 weight/bias，冻结 embedding/lm_head/norm。
-QFT_TRAIN_QUANTIZED_MODULE_ONLY=${QFT_TRAIN_QUANTIZED_MODULE_ONLY:-True}
-# 是否保留旧代码在每个 zo_lowbit update 后额外 forward 一次的行为。默认关闭。
-POST_UPDATE_FORWARD=${POST_UPDATE_FORWARD:-False}
 
 # -------------------- 交替策略和 QZO-scale 参数 --------------------
 ALT_A_STEPS=${ALT_A_STEPS:-1}                  # 每个周期 LoQZO 步数
@@ -445,6 +501,13 @@ QZO_SCALE_SCOPE=${QZO_SCALE_SCOPE:-weight}     # weight / activation / all
 QZO_LAYERWISE_SCALE_PERTURB=${QZO_LAYERWISE_SCALE_PERTURB:-False}
 CLIP_ZO_GRAD=${CLIP_ZO_GRAD:-False}
 QZO_CLIP_THRESHOLD=${QZO_CLIP_THRESHOLD:-100.0}
+
+# -------------------- 最终评估设置 --------------------
+# 旧脚本固定 eval_num_demos=32，会让 LLaMA2 在 MultiRC/ReCoRD/SQuAD/DROP 上最终评估非常慢。
+# 主表格通常建议先用 0 demo；如需复现实验中的 few-shot evaluation，可显式设 EVAL_NUM_DEMOS=32。
+USE_EVAL_DEMOS_AFTER_TRAINING=${USE_EVAL_DEMOS_AFTER_TRAINING:-True}
+EVAL_NUM_DEMOS=${EVAL_NUM_DEMOS:-0}
+EVAL_DEMO_SEED=${EVAL_DEMO_SEED:-0}
 
 # -------------------- WandB / 日志 --------------------
 WANDB_PROJECT=${WANDB_PROJECT:-LLM_LoQZO_github}
@@ -478,7 +541,7 @@ EXTRA_ARGS=()
 [ "$GRADIENT_CHECKPOINTING" = "True" ] && EXTRA_ARGS+=(--gradient_checkpointing True)
 [ "$FORCE_DISABLE_BNB" = "True" ] && EXTRA_ARGS+=(--force_disable_bnb True)
 [ "$NO_OUTLIER" = "True" ] && EXTRA_ARGS+=(--no_outlier True)
-EXTRA_ARGS+=(--prefer_local_model "$PREFER_LOCAL_MODEL" --max_length "$MAX_LENGTH" --max_new_tokens "$MAX_NEW_TOKENS" --report_to "$REPORT_TO")
+EXTRA_ARGS+=(--prefer_local_model "$PREFER_LOCAL_MODEL" --max_length "$MAX_LENGTH" --report_to "$REPORT_TO")
 
 RUN_NAME="$TASK-${MODEL_NAME}-${PRECISION_PROFILE:-manual_W${WBIT}A${ABIT}}-altA${ALT_A_STEPS}B${ALT_B_STEPS}-r${LOQZO_RANK}-lr${LR}"
 [ -n "$TAG" ] && RUN_NAME="$TAG-$RUN_NAME"
@@ -518,13 +581,17 @@ echo "PYTHONPATH : $PYTHONPATH"
 echo "BS(real)=$REAL_BS | BS(per_device)=$BS | GRAD_ACC=$GRAD_ACC"
 echo "LR=$LR | EPS=$EPS | QZO_EPS=${QZO_EPS} | STEPS=$STEPS | EPOCHS=$EPOCHS"
 echo "PRECISION_PROFILE=${PRECISION_PROFILE:-manual} | WBIT/ABIT/PBIT=$WBIT/$ABIT/$PBIT | QMODE=$QMODE | WMODE=$WMODE | AMODE=$AMODE"
+echo "LOAD dtype: fp16=$LOAD_FLOAT16 bf16=$LOAD_BFLOAT16 int8=$LOAD_INT8 int4=$LOAD_INT4 | AUTO_BF16_FOR_LARGE_MODEL=$AUTO_BF16_FOR_LARGE_MODEL"
+echo "MAX_LENGTH=$MAX_LENGTH | FAST_TASK_LENGTH=$FAST_TASK_LENGTH"
 echo "ALT: LoQZO=$ALT_A_STEPS | QZO-scale=$ALT_B_STEPS | ALT_START=$ALT_START"
-echo "LoQZO: rank=$LOQZO_RANK adaptive=$LOQZO_ADAPTIVE_RANK basis=$LOQZO_BASIS_INIT"
-echo "QZO-scale: scope=$QZO_SCALE_SCOPE lr_mult=$QZO_SCALE_LR_MULT layerwise=$QZO_LAYERWISE_SCALE_PERTURB clip=$CLIP_ZO_GRAD threshold=$QZO_CLIP_THRESHOLD"
+echo "LoQZO: rank=$LOQZO_RANK adaptive=$LOQZO_ADAPTIVE_RANK basis=$LOQZO_BASIS_INIT fast_addmm=$LOQZO_FAST_ADDMM cache_params=$CACHE_TRAINABLE_PARAMS"
+echo "LoQZO lazy sampling: update_basis=$LOQZO_UPDATE_BASIS sample_U=every_step v_update_freq=$LOQZO_V_UPDATE_FREQ legacy_u_update_freq=$LOQZO_U_UPDATE_FREQ"
+echo "LoQZO skip/fuse: fullspace_1d=$LOQZO_FULLSPACE_FOR_1D skip_non_subspace_2d=$LOQZO_SKIP_NON_SUBSPACE_2D cache_coeff=$LOQZO_CACHE_LOWRANK_COEFF fuse_restore_update=$LOQZO_FUSE_RESTORE_UPDATE"
+echo "QZO-scale: scope=$QZO_SCALE_SCOPE lr_mult=$QZO_SCALE_LR_MULT layerwise=$QZO_LAYERWISE_SCALE_PERTURB clip=$CLIP_ZO_GRAD threshold=$QZO_CLIP_THRESHOLD cache_params=$QZO_CACHE_SCALE_PARAMS cache_delta=$QZO_CACHE_SCALE_DELTAS"
 echo "QZO-scale clamp: min=$QZO_SCALE_MIN max=$QZO_SCALE_MAX max_mult=$QZO_SCALE_MAX_MULT"
-echo "TRAIN/DEV/EVAL=$TRAIN/$DEV/$EVAL | NO_EVAL=$NO_EVAL | EVAL_DURING_TRAINING=$EVAL_DURING_TRAINING"
-echo "MAX_LENGTH=$MAX_LENGTH | MAX_NEW_TOKENS=$MAX_NEW_TOKENS | EVAL_DEMOS=$USE_EVAL_DEMOS_AFTER_TRAINING/$EVAL_NUM_DEMOS | EVAL_CAND_BS=$EVAL_CANDIDATE_BATCH_SIZE"
-echo "Speed flags: qft_quantized_only=$QFT_TRAIN_QUANTIZED_MODULE_ONLY | fast_lowrank=$LOQZO_FAST_LOWRANK_UPDATE | requant_every=$LOQZO_REQUANTIZE_WEIGHT_EVERY | post_update_forward=$POST_UPDATE_FORWARD"
+echo "TRAIN/DEV/EVAL=$TRAIN/$DEV/$EVAL | NO_EVAL=$NO_EVAL | EVAL_DURING_TRAINING=$EVAL_DURING_TRAINING | SKIP_POST_UPDATE_FORWARD=$SKIP_POST_UPDATE_FORWARD"
+echo "Speed extra: prepare_inputs_once=$PREPARE_INPUTS_ONCE_FOR_ZO fast_eval_mode=$FAST_ZO_EVAL_MODE disable_train_use_cache=$DISABLE_TRAIN_USE_CACHE qft_linear_only=$QFT_TRAIN_QUANTIZED_LINEAR_ONLY qft_train_bias=$QFT_TRAIN_BIAS"
+echo "Speed v3: fast_option_loss=$FAST_OPTION_LOSS fast_eval_batch_options=$FAST_EVAL_BATCH_OPTIONS skip_flos=$SKIP_FLOS_METER_FOR_ZO disable_nan_inf_filter=$DISABLE_NAN_INF_FILTER_FOR_ZO fast_int_quant=$FAST_INT_QUANT no_outlier=$NO_OUTLIER eval_num_demos=$EVAL_NUM_DEMOS"
 echo "============================================================"
 
 COMMON_ARGS=(
@@ -533,6 +600,12 @@ COMMON_ARGS=(
   --train_set_seed "$SEED" --num_train "$TRAIN" --num_dev "$DEV" --num_eval "$EVAL"
   --logging_steps "$LOGGING_STEPS" --gradient_accumulation_steps "$GRAD_ACC" --optim "$OPTIM"
   --learning_rate "$LR" --zo_eps "$EPS" --per_device_train_batch_size "$BS"
+  --skip_post_update_forward "$SKIP_POST_UPDATE_FORWARD" --cache_trainable_params "$CACHE_TRAINABLE_PARAMS"
+  --loqzo_fast_addmm "$LOQZO_FAST_ADDMM" --qzo_cache_scale_params "$QZO_CACHE_SCALE_PARAMS" --qzo_cache_scale_deltas "$QZO_CACHE_SCALE_DELTAS"
+  --prepare_inputs_once_for_zo "$PREPARE_INPUTS_ONCE_FOR_ZO" --fast_zo_eval_mode "$FAST_ZO_EVAL_MODE" --disable_train_use_cache "$DISABLE_TRAIN_USE_CACHE"
+  --qft_train_quantized_linear_only "$QFT_TRAIN_QUANTIZED_LINEAR_ONLY" --qft_train_bias "$QFT_TRAIN_BIAS"
+  --fast_option_loss "$FAST_OPTION_LOSS" --fast_eval_batch_options "$FAST_EVAL_BATCH_OPTIONS"
+  --skip_flos_meter_for_zo "$SKIP_FLOS_METER_FOR_ZO" --disable_nan_inf_filter_for_zo "$DISABLE_NAN_INF_FILTER_FOR_ZO" --fast_int_quant "$FAST_INT_QUANT"
   --save_strategy steps --save_steps "$SAVE_STEPS" --no_eval "$NO_EVAL"
   --quantized_perturb_ours "$TWO" --train_as_classification "$TRAIN_AS_CLS"
   --perturb_bits "$PBIT" --mask_ratio "$MASK_RATIO" --num_pertub "$NUM_PERTUB"
@@ -541,11 +614,11 @@ COMMON_ARGS=(
   --loqzo_enable "$LOQZO_ENABLE" --loqzo_rank "$LOQZO_RANK" --loqzo_adaptive_rank "$LOQZO_ADAPTIVE_RANK"
   --loqzo_rank_min "$LOQZO_RANK_MIN" --loqzo_rank_max "$LOQZO_RANK_MAX" --loqzo_rank_budget "$LOQZO_RANK_BUDGET"
   --loqzo_rank_update_freq "$LOQZO_RANK_UPDATE_FREQ" --loqzo_rank_ema "$LOQZO_RANK_EMA" --loqzo_basis_init "$LOQZO_BASIS_INIT"
+  --loqzo_update_basis "$LOQZO_UPDATE_BASIS" --loqzo_v_update_freq "$LOQZO_V_UPDATE_FREQ" --loqzo_u_update_freq "$LOQZO_U_UPDATE_FREQ"
+  --loqzo_update_v_every_step "$LOQZO_UPDATE_V_EVERY_STEP" --loqzo_u_refresh_mode "$LOQZO_U_REFRESH_MODE"
   --loqzo_include_embeddings "$LOQZO_INCLUDE_EMBEDDINGS" --loqzo_fullspace_for_1d "$LOQZO_FULLSPACE_FOR_1D"
+  --loqzo_skip_non_subspace_2d "$LOQZO_SKIP_NON_SUBSPACE_2D" --loqzo_cache_lowrank_coeff "$LOQZO_CACHE_LOWRANK_COEFF" --loqzo_fuse_restore_update "$LOQZO_FUSE_RESTORE_UPDATE"
   --loqzo_quantize_coeff "$LOQZO_QUANTIZE_COEFF" --loqzo_coeff_bits "$LOQZO_COEFF_BITS"
-  --loqzo_fast_lowrank_update "$LOQZO_FAST_LOWRANK_UPDATE" --loqzo_requantize_weight_every "$LOQZO_REQUANTIZE_WEIGHT_EVERY"
-  --qft_train_quantized_module_only "$QFT_TRAIN_QUANTIZED_MODULE_ONLY" --post_update_forward "$POST_UPDATE_FORWARD"
-  --eval_candidate_batch_size "$EVAL_CANDIDATE_BATCH_SIZE"
   --alt_a_steps "$ALT_A_STEPS" --alt_b_steps "$ALT_B_STEPS" --alt_start "$ALT_START"
   --qzo_eps "$QZO_EPS" --qzo_scale_lr_mult "$QZO_SCALE_LR_MULT" --qzo_scale_min "$QZO_SCALE_MIN"
   --qzo_scale_max "$QZO_SCALE_MAX" --qzo_scale_max_mult "$QZO_SCALE_MAX_MULT"
@@ -617,9 +690,24 @@ esac
 #
 # FP / W8A8：权重 float8，激活 float8。
 # GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=FP_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_fp_w8a8
+# 
+
+# GPU_ID=5 TASK=SQuAD MODEL=Llama2-7B LOQZO_RANK=64 ALT_A_STEPS=1 ALT_B_STEPS=1 SEED=0 LR=1e-5 EPS=1e-3 PRECISION_PROFILE=FP_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname squad_fp_w8a8
+# GPU_ID=0 TASK=MultiRC MODEL=Llama2-7B LOQZO_RANK=128 ALT_A_STEPS=4 ALT_B_STEPS=1 SEED=0 LR=1e-5 EPS=1e-3 PRECISION_PROFILE=FP_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname MultiRC_128_lqazo
+# GPU_ID=2 TASK=DROP MODEL=Llama2-7B LOQZO_RANK=128 ALT_A_STEPS=0 ALT_B_STEPS=1 SEED=0 LR=1e-5 EPS=1e-3 PRECISION_PROFILE=FP_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname DROP_128_qzo
+#
+#主实验：INT W8A8
+# GPU_ID=1 TASK=MultiRC MODEL=Llama2-7B LOQZO_RANK=128 ALT_A_STEPS=0 ALT_B_STEPS=1  SEED=0 LR=1e-5 EPS=1e-3 WBIT=8 ABIT=8 PRECISION_PROFILE=INT_W8A8   STEPS=10000 SAVE_STEPS=50000 bash  Code/script/alternating_loqzo_qzo.sh --logname QZO_MultiRC_int_w8a8
 #
 # INT / W8A8：权重 int8，激活 int8。
-# GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=INT_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_int_w8a8
+# GPU_ID=0 TASK=SST2 MODEL=Llama2-7B LOQZO_RANK=128 ALT_A_STEPS=4 ALT_B_STEPS=1 SEED=0 LR=1e-5 EPS=1e-3 PRECISION_PROFILE=INT_W8A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_lqazo_intw8a8
 #
 # INT/FP / W4A8：权重 int4，激活 float8。默认 profile 就是这个。
 # GPU_ID=0 TASK=SST2 MODEL=Llama2-7B PRECISION_PROFILE=INTFP_W4A8 STEPS=10000 SAVE_STEPS=50000 bash Code/script/alternating_loqzo_qzo.sh --logname sst2_intfp_w4a8
+#
+#
+#   INT/FP W4A4参数设定
+# RANK=128 LQAZO(A=1 B=4) QZO(A=0 B=1) LR=1e-5 EPS=1e-3 
+# 
+# GPU_ID=4 TASK=SST2 MODEL=Llama2-7B LOQZO_RANK=128 ALT_A_STEPS=0 ALT_B_STEPS=1  SEED=0 LR=1e-5 EPS=1e-3  PRECISION_PROFILE= WBIT=4 ABIT=4 QMODE=int WMODE=int AMODE=float STEPS=10000 SAVE_STEPS=50000 bash  Code/script/alternating_loqzo_qzo.sh --logname QZO_SST2_w4a4
+#

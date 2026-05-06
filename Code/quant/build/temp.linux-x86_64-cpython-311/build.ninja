@@ -1,11 +1,11 @@
 ninja_required_version = 1.3
-cxx = /usr/bin/g++-10
-nvcc = /home/zhangjia/cuda-12.1/bin/nvcc
+cxx = /usr/bin/g++
+nvcc = /usr/local/cuda-12.1/bin/nvcc
 
-cflags = -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -Iincludes -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include/TH -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include/THC -I/home/zhangjia/cuda-12.1/include -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/include -I/home/zhangjia/.pyenv/versions/3.11.9/include/python3.11 -c
+cflags = -Wsign-compare -DNDEBUG -g -fwrapv -O3 -Wall -fPIC -Iincludes -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include/TH -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include/THC -I/usr/local/cuda-12.1/include -I/hy-tmp/NeurIPS2026/lqazo_env/include -I/root/.pyenv/versions/3.11.9/include/python3.11 -c
 post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=quant_cuda -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17
-cuda_cflags = -Iincludes -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include/TH -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/lib/python3.11/site-packages/torch/include/THC -I/home/zhangjia/cuda-12.1/include -I/home/zhangjia/Code/LoQZO/LoQZO/loqzo_env/include -I/home/zhangjia/.pyenv/versions/3.11.9/include/python3.11 -c
-cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=quant_cuda -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_80,code=compute_80 -gencode=arch=compute_80,code=sm_80 -ccbin /usr/bin/gcc-10 -std=c++17
+cuda_cflags = -Iincludes -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include/torch/csrc/api/include -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include/TH -I/hy-tmp/NeurIPS2026/lqazo_env/lib/python3.11/site-packages/torch/include/THC -I/usr/local/cuda-12.1/include -I/hy-tmp/NeurIPS2026/lqazo_env/include -I/root/.pyenv/versions/3.11.9/include/python3.11 -c
+cuda_post_cflags = -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__ -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__ --expt-relaxed-constexpr --compiler-options ''"'"'-fPIC'"'"'' -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_gcc"' '-DPYBIND11_STDLIB="_libstdcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1011"' -DTORCH_EXTENSION_NAME=quant_cuda -D_GLIBCXX_USE_CXX11_ABI=0 -gencode=arch=compute_89,code=compute_89 -gencode=arch=compute_89,code=sm_89 -ccbin /usr/bin/gcc -std=c++17
 cuda_dlink_post_cflags = 
 ldflags = 
 
@@ -23,8 +23,8 @@ rule cuda_compile
 
 
 
-build /home/zhangjia/Code/LoQZO/LoQZO/Code/quant/build/temp.linux-x86_64-cpython-311/quant.o: compile /home/zhangjia/Code/LoQZO/LoQZO/Code/quant/quant.cpp
-build /home/zhangjia/Code/LoQZO/LoQZO/Code/quant/build/temp.linux-x86_64-cpython-311/quant_kernel.o: cuda_compile /home/zhangjia/Code/LoQZO/LoQZO/Code/quant/quant_kernel.cu
+build /hy-tmp/NeurIPS2026/Code/quant/build/temp.linux-x86_64-cpython-311/quant.o: compile /hy-tmp/NeurIPS2026/Code/quant/quant.cpp
+build /hy-tmp/NeurIPS2026/Code/quant/build/temp.linux-x86_64-cpython-311/quant_kernel.o: cuda_compile /hy-tmp/NeurIPS2026/Code/quant/quant_kernel.cu
 
 
 

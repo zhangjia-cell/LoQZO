@@ -261,38 +261,6 @@ def quantize_gradients(parameters, bits=8):
             param.grad.data = grad * (max_val - min_val) + min_val  # Rescale
 
 
-def _safe_bernoulli_probability(prob: torch.Tensor) -> torch.Tensor:
-    """
-    将随机舍入的小数概率清洗到 [0, 1]。
-
-    说明：
-    torch.bernoulli 要求输入概率严格位于 [0, 1]。当训练后期参数/scale 出现
-    Inf、NaN 或极端大值时，rest = x_scaled - floor(x_scaled) 可能变成 NaN，
-    CUDA 会触发 `Assertion 0 <= p && p <= 1` 并中断进程。
-    这里做防御性处理，不改变正常情况下的随机舍入结果。
-    """
-    return torch.nan_to_num(prob, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-
-
-def _safe_positive_scale(scale, device=None, dtype=None, eps: float = 1e-12):
-    """
-    保证量化 scale / scaling_factor 是有限正数。
-
-    说明：
-    参数全零、全 NaN 或训练发散时，scale 可能为 0/NaN/Inf。
-    如果继续除以这个值，会把量化结果污染成 NaN，最终导致随机舍入崩溃。
-    """
-    if not torch.is_tensor(scale):
-        scale = torch.tensor(scale, device=device, dtype=dtype if dtype is not None else torch.float32)
-    if device is not None and scale.device != torch.device(device):
-        scale = scale.to(device=device)
-    if dtype is not None and scale.dtype != dtype:
-        scale = scale.to(dtype=dtype)
-    fallback = torch.full_like(scale, eps)
-    scale = torch.where(torch.isfinite(scale) & (scale.abs() > eps), scale, fallback)
-    return scale
-
-
 # 随机舍入量化：
 # 给定一个浮点张量，先按 scale 缩放到整数网格，再根据小数部分做 Bernoulli 随机上取整。
 # 返回值里同时包含：
@@ -313,17 +281,19 @@ def stochastic_quantize(tensor, bit_width=8):
         dequantized_tensor (torch.Tensor): Dequantized tensor.
     """
     # Compute scaling factor
-    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
     max_abs_value = torch.max(torch.abs(tensor))
     scale = max_abs_value / (2**(bit_width - 1) - 1)  # Signed quantization
-    scale = _safe_positive_scale(scale, device=tensor.device, dtype=tensor.dtype, eps=1e-6)
+
+    # Avoid division by zero
+    if scale == 0:
+        scale = 1e-6
 
     # Normalize tensor to quantization range
     normalized_tensor = tensor / scale
 
     # Compute stochastic rounding
     lower = torch.floor(normalized_tensor)  # Floor value
-    fractional = _safe_bernoulli_probability(normalized_tensor - lower)  # Fractional part
+    fractional = normalized_tensor - lower  # Fractional part
     stochastic = torch.bernoulli(fractional)  # Bernoulli(p=fractional)
 
     # Quantize with stochastic rounding
@@ -350,9 +320,6 @@ def zo_quant_data(x, nbits=16,blk_exp=True, sym=True, stochastic=True, seed=None
     
     if seed is not None:
         torch.manual_seed(seed)
-
-    # 防止上游发散产生 NaN/Inf 后继续污染随机舍入概率。
-    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     
     # n_levels = 2**nbits
     n_levels = 2**(nbits-1)
@@ -367,11 +334,9 @@ def zo_quant_data(x, nbits=16,blk_exp=True, sym=True, stochastic=True, seed=None
     
     # Calculate the scale factor a
     scaling_factor = n_levels / (x1 - x0)
-    scaling_factor = _safe_positive_scale(scaling_factor, device=x.device, dtype=x.dtype)
 
     if blk_exp:  # block exponent
         scaling_factor = 2**torch.floor(torch.log2(scaling_factor))
-        scaling_factor = _safe_positive_scale(scaling_factor, device=x.device, dtype=x.dtype)
     # if scaling_factor == 0:
     #         scaling_factor = 1e-6
     # Calculate the zero point b
@@ -380,7 +345,7 @@ def zo_quant_data(x, nbits=16,blk_exp=True, sym=True, stochastic=True, seed=None
     if stochastic:
         # Apply stochastic rounding
         x_floor = torch.floor(x * scaling_factor)
-        rest = _safe_bernoulli_probability(x * scaling_factor - x_floor)
+        rest = x * scaling_factor - x_floor
         x_int = x_floor + torch.bernoulli(rest)  # Use random rounding based on the fractional part
     else:
         # Apply standard rounding
@@ -447,9 +412,6 @@ def zo_quant(x, nbits=4, sym=True, stochastic=True, seed=None):
     # Set the random seed if provided
     if seed is not None:
         torch.manual_seed(seed)
-
-    # 防止扰动量化阶段因为 NaN/Inf 产生非法 Bernoulli 概率。
-    x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     
     if nbits == 1:
         # 1-bit quantization (binary quantization)
@@ -466,14 +428,14 @@ def zo_quant(x, nbits=4, sym=True, stochastic=True, seed=None):
         if sym:
             # For signed quantization, levels could be -3, -1, +1, +3 (centered around 0)
             x1 = x.abs().max()  # max absolute value for symmetric quantization
-            scaler = _safe_positive_scale(3 / x1, device=x.device, dtype=x.dtype)
+            scaler = 3 / x1
             x_scaled = x * scaler
             x_quant = torch.round(x_scaled).clamp(-3, 3)  # Clamp to the 4 levels
             zero_point = 0
         else:
             # For unsigned quantization, levels could be 0, 1, 2, 3
             x_min, x_max = x.min(), x.max()
-            scaler = _safe_positive_scale(3 / (x_max - x_min), device=x.device, dtype=x.dtype)
+            scaler = 3 / (x_max - x_min)
             zero_point = torch.round(-scaler * x_min)
             x_scaled = x * scaler + zero_point
             x_quant = torch.round(x_scaled).clamp(0, 3)
@@ -485,18 +447,18 @@ def zo_quant(x, nbits=4, sym=True, stochastic=True, seed=None):
         
         if sym:
             x1 = x.abs().max()  # Max absolute value
-            scaler = _safe_positive_scale(n_levels / x1, device=x.device, dtype=x.dtype)
+            scaler = n_levels / x1
             zero_point = 0  # Center around 0 for symmetric quantization
         else:
             x_min, x_max = x.min(), x.max()
-            scaler = _safe_positive_scale(n_levels / (x_max - x_min), device=x.device, dtype=x.dtype)
+            scaler = n_levels / (x_max - x_min)
             zero_point = torch.round(-scaler * x_min)
 
         # Apply scaling and optional stochastic rounding
         x_scaled = x * scaler
         if stochastic:
             x_floor = torch.floor(x_scaled)
-            rest = _safe_bernoulli_probability(x_scaled - x_floor)
+            rest = x_scaled - x_floor
             x_quant = x_floor + torch.bernoulli(rest)  # Stochastic rounding
         else:
             x_quant = torch.round(x_scaled)
@@ -563,13 +525,7 @@ def zo_dequant(x_quant, scaling_factor, zero_point):
 
     
     # Dequantize the result
-    scaling_factor = _safe_positive_scale(
-        scaling_factor,
-        device=x_quant.device if torch.is_tensor(x_quant) else None,
-        dtype=x_quant.dtype if torch.is_tensor(x_quant) and x_quant.is_floating_point() else None,
-    )
     qx = (x_quant - zero_point) / scaling_factor
-    qx = torch.nan_to_num(qx, nan=0.0, posinf=0.0, neginf=0.0)
     # qx = (qx - x).detach() + x
     
     return qx  # Return the quantized and dequantized tensor
@@ -1027,8 +983,15 @@ class OurTrainer(Trainer):
                     else:
                         tr_loss_step = self.training_step(model, inputs)
 
+                # 中文说明：原 HF Trainer 的 NaN/Inf 过滤会在每个 step 用 Tensor bool 进入 Python if，
+                # 这会触发 GPU->CPU 同步。ZO/LoQZO 的 loss 只是投影梯度估计的中间量，
+                # 主实验默认关闭该同步检查；如需调试 NaN，可把 disable_nan_inf_filter_for_zo=False。
+                nan_inf_filter_enabled = bool(args.logging_nan_inf_filter)
+                if args.trainer in {"zo", "zo_lowbit", "zo_lowbit_ft"} and bool(getattr(args, "disable_nan_inf_filter_for_zo", False)):
+                    nan_inf_filter_enabled = False
+
                 if (
-                    args.logging_nan_inf_filter
+                    nan_inf_filter_enabled
                     and not is_torch_tpu_available()
                     and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
                 ):
@@ -1037,7 +1000,10 @@ class OurTrainer(Trainer):
                 else:
                     tr_loss += tr_loss_step
 
-                self.current_flos += float(self.floating_point_ops(inputs))
+                # floating_point_ops 主要用于 FLOPs 统计；ZO 大模型每 step 统计没有训练贡献，
+                # 关闭后不影响 loss/参数更新，可减少 Python 开销。
+                if not (args.trainer in {"zo", "zo_lowbit", "zo_lowbit_ft"} and bool(getattr(args, "skip_flos_meter_for_zo", False))):
+                    self.current_flos += float(self.floating_point_ops(inputs))
 
                 # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
                 if self.deepspeed:
@@ -1058,13 +1024,11 @@ class OurTrainer(Trainer):
                         self.zo_update(model)
                     elif args.trainer == "zo_lowbit":
                         self.lowbit_zo_update(model)
-                        # 中文说明：原代码这里无条件额外做了一次 forward，注释为 "LoRA"。
-                        # 对 ZO/LoQZO/QZO 来说，每个 step 已经有 +eps / -eps 两次前向；
-                        # 这里的第三次前向既不参与梯度估计，也不参与参数更新，会把训练时间
-                        # 额外增加约 30% 以上。默认关闭，仅在调试旧 LoRA 行为时用
-                        # --post_update_forward True 手动打开。
-                        if bool(getattr(args, "post_update_forward", False)):
-                            self.zo_forward(model, inputs)
+                        # 中文说明：原代码这里每个 ZO step 更新后又额外做一次 forward，主要是早期 LoRA/调试遗留。
+                        # 对 LoQZO + QZO(scale) 来说，projected_grad 已经由前面的 +eps/-eps 两次 forward 得到，
+                        # 更新后这次 forward 不参与参数更新，也不会进入日志 loss；默认跳过可节省约 1/3 前向开销。
+                        if not bool(getattr(args, "skip_post_update_forward", True)):
+                            self.zo_forward(model, inputs)  # LoRA/调试兼容开关
                     elif args.trainer == "zo_lowbit_ft":
                             self.lowbit_zo_ftupdate(model)
                     else:
@@ -1415,6 +1379,40 @@ class OurTrainer(Trainer):
 
 
 
+    # ----------------------------- ZO 前向加速辅助 -----------------------------
+    def _zo_inputs_are_prepared(self, inputs) -> bool:
+        """判断 batch 是否已经搬到 CUDA/目标设备。
+
+        HF Trainer 的 _prepare_inputs 默认会返回新对象；如果在同一个 ZO step 的
+        +eps / -eps 两次 forward 中反复调用，就可能重复做 CPU->GPU 拷贝。
+        这里用一个轻量检查避免对已经在 GPU 上的 batch 再走完整搬运流程。
+        """
+        if not bool(getattr(self.args, "prepare_inputs_once_for_zo", True)):
+            return False
+
+        def _has_cpu_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.device.type == "cpu"
+            if isinstance(x, dict):
+                return any(_has_cpu_tensor(v) for v in x.values())
+            if isinstance(x, (list, tuple)):
+                return any(_has_cpu_tensor(v) for v in x)
+            return False
+
+        return not _has_cpu_tensor(inputs)
+
+    def _zo_prepare_inputs_once(self, inputs):
+        if bool(getattr(self.args, "prepare_inputs_once_for_zo", True)) and not self._zo_inputs_are_prepared(inputs):
+            return self._prepare_inputs(inputs)
+        return inputs
+
+    def _zo_set_eval_once(self, model) -> None:
+        if bool(getattr(self.args, "fast_zo_eval_mode", True)):
+            if getattr(model, "training", False):
+                model.eval()
+        else:
+            model.eval()
+
     # ----------------------------- 无反传前向 -----------------------------
     # 零阶方法的关键就是：只做 forward，不保留 backward graph。
     # 这里会：
@@ -1426,13 +1424,14 @@ class OurTrainer(Trainer):
         """
         Get (no gradient) loss from the model. Dropout is turned off too.
         """
-        model.eval()
+        self._zo_set_eval_once(model)
         if self.args.non_diff:
             # Non-differentiable objective (may require autoregressive generation)
             return self.zo_forward_nondiff(model, inputs)
 
         with torch.inference_mode():
-            inputs = self._prepare_inputs(inputs)
+            if not self._zo_inputs_are_prepared(inputs):
+                inputs = self._prepare_inputs(inputs)
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
             if self.args.n_gpu > 1:
@@ -1452,11 +1451,12 @@ class OurTrainer(Trainer):
         """
         Get (no gradient) non-diffiable loss from the model.
         """
-        model.eval()
+        self._zo_set_eval_once(model)
         assert self.args.task_name == "SQuAD", "Non differentiable objective only supports SQuAD for now."
 
         with torch.inference_mode():
-            inputs = self._prepare_inputs(inputs)
+            if not self._zo_inputs_are_prepared(inputs):
+                inputs = self._prepare_inputs(inputs)
             args = self.args
             outputs = self.model.generate(
                 inputs["input_ids"], do_sample=args.sampling, temperature=args.temperature, 
@@ -1485,6 +1485,7 @@ class OurTrainer(Trainer):
         Estimate gradient by MeZO. Return the loss from f(theta + z)
         """
         args = self.args
+        inputs = self._zo_prepare_inputs_once(inputs)
 
         # What parameters to optimize 
         self.named_parameters_to_optim = []
@@ -1545,6 +1546,7 @@ class OurTrainer(Trainer):
         Estimate gradient by MeZO. Return the loss from f(theta + z)
         """
         args = self.args
+        inputs = self._zo_prepare_inputs_once(inputs)
 
         # What parameters to optimize 
         self.named_parameters_to_optim = []
@@ -1572,10 +1574,8 @@ class OurTrainer(Trainer):
             projected_grad = self._all_reduce_mean_scalar((loss1 - loss2) / (2 * self.args.zo_eps))
             max_abs_value = torch.max(torch.abs(projected_grad))
 
-            # Calculate scaling factor
-            s = max_abs_value / 127
-            if s == 0:
-                s = 1e-3  # 使用更大的保护值
+            # Calculate scaling factor；用 clamp 避免 if s == 0 触发 GPU 同步。
+            s = torch.clamp(max_abs_value / 127, min=1e-12)
             quantized_grad = torch.round(projected_grad / s)
             quantized_grad = torch.clamp(quantized_grad, -127, 127)
             self.projected_grad = quantized_grad * s
@@ -1601,6 +1601,7 @@ class OurTrainer(Trainer):
         Estimate gradient by MeZO. Return the loss from f(theta + z)
         """
         args = self.args
+        inputs = self._zo_prepare_inputs_once(inputs)
 
         # What parameters to optimize 
         self.named_parameters_to_optim = []

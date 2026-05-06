@@ -164,22 +164,19 @@ class OurTrainer(LoQZOTrainer):
 
         注意：这些 alpha 在 LoQZO 阶段通常 requires_grad=False，
         但 QZO 是手动零阶更新，所以这里不能用 requires_grad 过滤。
-        量化模型结构训练中不会变，因此收集结果默认缓存，避免每个 B-step
-        都遍历一次 LLaMA 的全部 named_parameters。
         """
-        cache_key = self._qzo_scale_scope()
-        cached_key = getattr(self, "_qzo_scale_cache_key", None)
-        cached_scales = getattr(self, "_qzo_scale_parameters_cache", None)
-        if cached_scales is not None and cached_key == cache_key:
-            return cached_scales
+        # QZO 的 alpha 参数列表在 qft 包装后基本固定。
+        # 缓存后可以避免每个 B-step 都遍历一次 7B 模型的全部 named_parameters。
+        if bool(getattr(self.args, "qzo_cache_scale_params", True)) and hasattr(self, "_qzo_scale_parameters_cache"):
+            return self._qzo_scale_parameters_cache
 
         scales: List[Tuple[str, torch.nn.Parameter]] = []
         for name, param in model.named_parameters():
             if self._qzo_name_in_scope(name):
                 scales.append((name, param))
 
-        self._qzo_scale_cache_key = cache_key
-        self._qzo_scale_parameters_cache = scales
+        if bool(getattr(self.args, "qzo_cache_scale_params", True)):
+            self._qzo_scale_parameters_cache = scales
 
         if len(scales) == 0:
             # 中文说明：FP_W32A32 / W32A32 这类全精度前向不会创建 quant_weight.alpha。
@@ -235,6 +232,35 @@ class OurTrainer(LoQZOTrainer):
             dtype=dtype,
         )
 
+    def _qzo_get_scale_deltas(self, random_seed: int) -> List[torch.Tensor]:
+        """返回当前 seed 对应的 QZO scale 扰动方向。
+
+        同一个 QZO step 的 +eps、-eps 和 update 必须使用同一个随机方向。
+        原实现会重复生成 3 次相同方向；缓存后算法不变，但减少随机数生成和 Python 循环开销。
+        """
+        use_cache = bool(getattr(self.args, "qzo_cache_scale_deltas", True))
+        cache_key = int(random_seed)
+        if use_cache and hasattr(self, "_qzo_scale_delta_cache") and cache_key in self._qzo_scale_delta_cache:
+            return self._qzo_scale_delta_cache[cache_key]
+
+        deltas: List[torch.Tensor] = []
+        seed = int(random_seed)
+        for _, param in self.qzo_scale_parameters:
+            deltas.append(self._qzo_sample_scale_delta(param, seed, which="qzo"))
+            seed += 2
+
+        if use_cache:
+            if not hasattr(self, "_qzo_scale_delta_cache"):
+                self._qzo_scale_delta_cache = {}
+            # 每个 step 只需要当前极少数 seed，避免无界增长。
+            self._qzo_scale_delta_cache.clear()
+            self._qzo_scale_delta_cache[cache_key] = deltas
+        return deltas
+
+    def _qzo_clear_scale_delta_cache(self) -> None:
+        if hasattr(self, "_qzo_scale_delta_cache"):
+            self._qzo_scale_delta_cache.clear()
+
     def _qzo_backup_scales(self) -> List[torch.Tensor]:
         """备份 scale，保证 +eps / -eps 前向之后能精确恢复。"""
         return [param.data.detach().clone() for _, param in self.qzo_scale_parameters]
@@ -258,21 +284,20 @@ class OurTrainer(LoQZOTrainer):
         这样可以避免 scale clamp 后无法精确恢复的问题。
         """
         eps = self._qzo_eps()
-        seed = int(random_seed)
+        deltas = self._qzo_get_scale_deltas(int(random_seed))
 
         for idx, (name, param) in enumerate(self.qzo_scale_parameters):
             if base_values is not None:
                 param.data.copy_(base_values[idx])
-            delta = self._qzo_sample_scale_delta(param, seed, which=which)
-            param.data.add_(float(scaling_factor) * eps * delta)
+            param.data.add_(deltas[idx], alpha=float(scaling_factor) * eps)
             self._qzo_clamp_scale_(name, param)
-            seed += 2
 
     # ========================================================
     # QZO-scale step / update
     # ========================================================
     def qzo_step(self, model, inputs):
         """QZO 阶段：只扰动量化 scale，估计方向导数。"""
+        inputs = self._zo_prepare_inputs_once(inputs)
         self.qzo_scale_parameters = self._qzo_collect_scale_parameters(model)
         if len(self.qzo_scale_parameters) == 0:
             # FP_W32A32 没有 alpha；此时把 B 阶段当作 LoQZO 权重更新处理。
@@ -326,16 +351,17 @@ class OurTrainer(LoQZOTrainer):
         for i in range(iterations):
             qzo_seed = int(self.qzo_random_seed[i])
             projected_grad = self._qzo_clip_value(self.qzo_projected_grad[i])
+            if isinstance(projected_grad, torch.Tensor):
+                pg_value = float(projected_grad.detach().float().item())
+            else:
+                pg_value = float(projected_grad)
 
-            seed = qzo_seed
-            for name, param in self.qzo_scale_parameters:
-                # alpha 可能分布在不同 GPU，上一步的 projected_grad 需移动到当前 alpha 的设备。
-                pg = projected_grad.to(device=param.data.device, dtype=param.data.dtype) if isinstance(projected_grad, torch.Tensor) else projected_grad
-                delta = self._qzo_sample_scale_delta(param, seed, which="q2")
-                param.data.add_(-lr * pg * delta)
+            deltas = self._qzo_get_scale_deltas(qzo_seed)
+            for idx, (name, param) in enumerate(self.qzo_scale_parameters):
+                param.data.add_(deltas[idx], alpha=-lr * pg_value)
                 self._qzo_clamp_scale_(name, param)
-                seed += 2
 
+        self._qzo_clear_scale_delta_cache()
         self.lr_scheduler.step()
 
     # ========================================================

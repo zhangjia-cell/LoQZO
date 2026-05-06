@@ -133,7 +133,10 @@ LOQZO_RANK_MAX=${LOQZO_RANK_MAX:-64}
 LOQZO_RANK_BUDGET=${LOQZO_RANK_BUDGET:-0}
 LOQZO_RANK_UPDATE_FREQ=${LOQZO_RANK_UPDATE_FREQ:-200}
 LOQZO_RANK_EMA=${LOQZO_RANK_EMA:-0.9}
-LOQZO_BASIS_INIT=${LOQZO_BASIS_INIT:-random_orth}
+LOQZO_BASIS_INIT=${LOQZO_BASIS_INIT:-random_normal}
+LOQZO_UPDATE_BASIS=${LOQZO_UPDATE_BASIS:-True}
+LOQZO_V_UPDATE_FREQ=${LOQZO_V_UPDATE_FREQ:-0}
+LOQZO_U_UPDATE_FREQ=${LOQZO_U_UPDATE_FREQ:-1000}
 LOQZO_TARGET_MODULES=${LOQZO_TARGET_MODULES:-}
 LOQZO_INCLUDE_EMBEDDINGS=${LOQZO_INCLUDE_EMBEDDINGS:-False}
 LOQZO_FULLSPACE_FOR_1D=${LOQZO_FULLSPACE_FOR_1D:-True}
@@ -247,6 +250,7 @@ echo "TRAIN/DEV/EVAL=$TRAIN/$DEV/$EVAL | NO_EVAL=$NO_EVAL | EVAL_DURING_TRAINING
 echo "WBIT/ABIT/PBIT=${EFFECTIVE_WBIT:-None}/${EFFECTIVE_ABIT}/${PBIT} | QMODE=$QMODE"
 echo "LOAD_BFLOAT16/LOAD_FLOAT16/LOAD_INT8/LOAD_INT4=$LOAD_BFLOAT16/$LOAD_FLOAT16/$EFFECTIVE_LOAD_INT8/$EFFECTIVE_LOAD_INT4"
 echo "LoQZO: enable=$LOQZO_ENABLE rank=$LOQZO_RANK adaptive=$LOQZO_ADAPTIVE_RANK rank_range=[$LOQZO_RANK_MIN,$LOQZO_RANK_MAX]"
+echo "LoQZO lazy sampling: update_basis=$LOQZO_UPDATE_BASIS sample_U=every_step v_update_freq=$LOQZO_V_UPDATE_FREQ legacy_u_update_freq=$LOQZO_U_UPDATE_FREQ"
 echo "LOG_PREFIX=$LOG_PREFIX | TIME_TAG=$TIME_TAG"
 echo "OVERWRITE_OUTPUT_DIR=$OVERWRITE_OUTPUT_DIR | RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-<未指定>}"
 echo "WANDB: USE_WANDB=$USE_WANDB | REPORT_TO=$REPORT_TO | WANDB_DISABLED=${WANDB_DISABLED:-<unset>}"
@@ -259,7 +263,7 @@ COMMON_ARGS=(
   --save_strategy steps --save_steps "$SAVE_STEPS" --no_eval "$NO_EVAL" --quantized_perturb_ours "$TWO" --train_as_classification "$TRAIN_AS_CLS" --perturb_bits "$PBIT"
   --tuning_type "$TYPE" --mask_ratio "$MASK_RATIO" --num_pertub "$NUM_PERTUB" --fo_quant_grad "$FO_QUANT_GRAD" --fo_quant_bits "$FO_QUANT_BITS" --use_grad_pre_hook_quant "$USE_GRAD_PRE_HOOK_QUANT" --grad_pre_hook_bits "$GRAD_PRE_HOOK_BITS"
   --overwrite_output_dir "$OVERWRITE_OUTPUT_DIR" --use_eval_demos_after_training True --eval_num_demos 32 --eval_demo_seed 0
-  --loqzo_enable "$LOQZO_ENABLE" --loqzo_rank "$LOQZO_RANK" --loqzo_adaptive_rank "$LOQZO_ADAPTIVE_RANK" --loqzo_rank_min "$LOQZO_RANK_MIN" --loqzo_rank_max "$LOQZO_RANK_MAX" --loqzo_rank_budget "$LOQZO_RANK_BUDGET" --loqzo_rank_update_freq "$LOQZO_RANK_UPDATE_FREQ" --loqzo_rank_ema "$LOQZO_RANK_EMA" --loqzo_basis_init "$LOQZO_BASIS_INIT" --loqzo_include_embeddings "$LOQZO_INCLUDE_EMBEDDINGS" --loqzo_fullspace_for_1d "$LOQZO_FULLSPACE_FOR_1D" --loqzo_quantize_coeff "$LOQZO_QUANTIZE_COEFF" --loqzo_coeff_bits "$LOQZO_COEFF_BITS"
+  --loqzo_enable "$LOQZO_ENABLE" --loqzo_rank "$LOQZO_RANK" --loqzo_adaptive_rank "$LOQZO_ADAPTIVE_RANK" --loqzo_rank_min "$LOQZO_RANK_MIN" --loqzo_rank_max "$LOQZO_RANK_MAX" --loqzo_rank_budget "$LOQZO_RANK_BUDGET" --loqzo_rank_update_freq "$LOQZO_RANK_UPDATE_FREQ" --loqzo_rank_ema "$LOQZO_RANK_EMA" --loqzo_basis_init "$LOQZO_BASIS_INIT" --loqzo_update_basis "$LOQZO_UPDATE_BASIS" --loqzo_v_update_freq "$LOQZO_V_UPDATE_FREQ" --loqzo_u_update_freq "$LOQZO_U_UPDATE_FREQ" --loqzo_include_embeddings "$LOQZO_INCLUDE_EMBEDDINGS" --loqzo_fullspace_for_1d "$LOQZO_FULLSPACE_FOR_1D" --loqzo_quantize_coeff "$LOQZO_QUANTIZE_COEFF" --loqzo_coeff_bits "$LOQZO_COEFF_BITS"
 )
 [ -n "$LOQZO_TARGET_MODULES" ] && COMMON_ARGS+=(--loqzo_target_modules "$LOQZO_TARGET_MODULES")
 if [ "$EVAL_DURING_TRAINING" = "True" ]; then COMMON_ARGS+=(--evaluation_strategy steps --eval_steps "$EVAL_STEPS"); else COMMON_ARGS+=(--evaluation_strategy no); fi

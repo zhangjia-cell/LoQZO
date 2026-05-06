@@ -28,19 +28,131 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 logger = logging.getLogger(__name__)
 
 
+def _model_has_fast_option_loss_path(model) -> bool:
+    """判断当前 decoder-only LM 是否支持“只对 option token 调 lm_head”的快速 loss。"""
+    return bool(hasattr(model, "model") and hasattr(model, "lm_head"))
+
+
+def _fast_forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=None, num_options=None, return_dict=None, **kwargs):
+    """only_train_option 的快速等价实现。
+
+    旧实现会先调用 CausalLM.forward 得到整段 prompt 的 logits，形状为
+    [batch, seq_len, vocab]，随后再把非 option token 的 label 置为 -100。
+    对 SST-2/RTE/MultiRC 这类任务，真正参与 loss 的通常只有最后 1~数个 option token，
+    因此整段 prompt 的 full-vocab logits 是无效计算。
+
+    这里直接调用 backbone 得到 hidden states，只选出需要预测 option token 的位置，
+    再对这些 hidden states 调 lm_head。loss 与旧实现等价，但显著减少 lm_head、log_softmax
+    和 logits 张量显存开销。默认只由交替算法脚本打开，baseline 不会被强制改变。
+    """
+    if labels is None or option_len is None or not _model_has_fast_option_loss_path(self):
+        return None
+
+    # 传给 backbone 的 kwargs 需要去掉 CausalLM.forward 专属字段；保留 attention_mask/position_ids 等。
+    backbone_kwargs = dict(kwargs)
+    backbone_kwargs.pop("use_cache", None)
+    backbone_outputs = self.model(input_ids=input_ids, use_cache=False, **backbone_kwargs)
+    hidden_states = backbone_outputs[0]
+
+    # hidden_states[:, t] 预测 input_ids[:, t+1]。
+    shift_hidden = hidden_states[..., :-1, :]
+    shift_labels = torch.clone(input_ids)[..., 1:].contiguous()
+    pad_token_id = getattr(self.config, "pad_token_id", None)
+    if pad_token_id is not None:
+        shift_labels[shift_labels == pad_token_id] = -100
+
+    if isinstance(option_len, torch.Tensor):
+        option_len_list = option_len.detach().cpu().tolist()
+    else:
+        option_len_list = list(option_len)
+
+    mask = torch.zeros_like(shift_labels, dtype=torch.bool)
+    for _i, _len in enumerate(option_len_list):
+        _len = max(0, int(_len))
+        if _len > 0:
+            mask[_i, -_len:] = shift_labels[_i, -_len:] != -100
+
+    loss_fct = CrossEntropyLoss(ignore_index=-100)
+    active_hidden = shift_hidden[mask]
+    active_labels = shift_labels[mask]
+    if active_hidden.shape[0] == 0:
+        loss = shift_hidden.sum() * 0.0
+        active_logits = torch.empty(0, getattr(self.config, "vocab_size", 0), device=shift_hidden.device, dtype=shift_hidden.dtype)
+    else:
+        active_logits = self.lm_head(active_hidden)
+
+        if num_options is not None:
+            active_log_probs = F.log_softmax(active_logits, dim=-1)
+            active_selected = active_log_probs.gather(-1, active_labels.unsqueeze(-1)).squeeze(-1)
+
+            # 把每个 option 的 token log-prob 聚合成一个 option score。
+            row_ids = mask.nonzero(as_tuple=False)[:, 0]
+            batch_rows = input_ids.size(0)
+            selected_log_probs = active_selected.new_zeros(batch_rows)
+            token_counts = active_selected.new_zeros(batch_rows)
+            selected_log_probs.scatter_add_(0, row_ids, active_selected)
+            token_counts.scatter_add_(0, row_ids, torch.ones_like(active_selected))
+            selected_log_probs = selected_log_probs / token_counts.clamp_min(1.0)
+
+            if isinstance(num_options, torch.Tensor):
+                num_options_list = num_options.detach().cpu().tolist()
+            else:
+                num_options_list = list(num_options)
+
+            if any([x != num_options_list[0] for x in num_options_list]):
+                loss = 0
+                start_id = 0
+                count = 0
+                while start_id < len(num_options_list):
+                    end_id = start_id + int(num_options_list[start_id])
+                    _logits = selected_log_probs[start_id:end_id].unsqueeze(0)
+                    _labels = labels[start_id:end_id][0].unsqueeze(0)
+                    loss = loss_fct(_logits, _labels) + loss
+                    count += 1
+                    start_id = end_id
+                loss = loss / max(count, 1)
+            else:
+                n_opt = int(num_options_list[0])
+                selected_log_probs = selected_log_probs.view(-1, n_opt)
+                cls_labels = labels.view(-1, n_opt)[:, 0]
+                loss = loss_fct(selected_log_probs, cls_labels)
+        else:
+            loss = loss_fct(active_logits, active_labels)
+
+    if not return_dict:
+        return (loss, active_logits)
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=active_logits,
+        past_key_values=None,
+        hidden_states=None,
+        attentions=None,
+    )
+
+
 def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=None, num_options=None, return_dict=None, **kwargs):
     """
     This is to replace the original forward function of Transformer models to enable:
     (1) Partial target sequence: loss will only be calculated on part of the sequence
     (2) Classification-style training: a classification loss (CE) will be calculated over several options
-    Input:
-    - input_ids, labels: same as the original forward function
-    - option_len: a list of int indicating the option lengths, and loss will be calculated only on the
-      last option_len tokens 
-    - num_options: a list of int indicating the number of options for each example (this will be #label
-      words for classification tasks and #choices for multiple choice tasks), and a classification loss
-      will be calculated.
+
+    当 self.fast_option_loss=True 时，使用等价快速路径：只对 option token 位置计算 lm_head/log_softmax，
+    避免为整段 prompt 的所有 token 构造 full-vocab logits。默认不开启，以免影响旧 baseline。
     """
+    if bool(getattr(self, "fast_option_loss", False)):
+        fast_outputs = _fast_forward_wrap_with_option_len(
+            self,
+            input_ids=input_ids,
+            labels=labels,
+            option_len=option_len,
+            num_options=num_options,
+            return_dict=return_dict,
+            **kwargs,
+        )
+        if fast_outputs is not None:
+            return fast_outputs
+
     outputs = self.original_forward(input_ids=input_ids, **kwargs)
     if labels is None:
         return outputs
@@ -59,7 +171,7 @@ def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=N
 
     # Calculate the loss
     loss_fct = CrossEntropyLoss(ignore_index=-100)
-    if num_options is not None: 
+    if num_options is not None:
         # Train as a classification tasks
         log_probs = F.log_softmax(shift_logits, dim=-1)
         mask = shift_labels != -100 # Option part
